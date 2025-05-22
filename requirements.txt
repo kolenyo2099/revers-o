@@ -1,0 +1,23 @@
+# Core dependencies
+numpy==1.26.0
+fsspec==2025.3.2
+opencv-python
+matplotlib
+qdrant-client
+gradio
+torch
+torchvision
+Pillow
+requests
+tqdm
+scikit-learn
+
+# Computer vision and ML dependencies
+autodistill-grounded-sam
+roboflow
+supervision
+
+# Perception models dependency (Apple Silicon compatible)
+eva-decord==0.6.1
+
+
