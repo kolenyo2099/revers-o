@@ -1588,7 +1588,7 @@ class GradioInterface:
             return f"Set active database to: {collection_name}"
         return "No database selected"
 
-    def process_image_with_prompt(self, image, text_prompt, min_area_ratio=0.01):
+    def process_image_with_prompt(self, image, text_prompt, min_area_ratio=0.01, max_regions=5, optimal_layer=40):
         """Process an uploaded image with a text prompt to detect regions"""
         if isinstance(image, np.ndarray):
             image_pil = Image.fromarray(image)
@@ -1605,8 +1605,8 @@ class GradioInterface:
             device_param=self.device,
             is_url=False,
             min_area_ratio=min_area_ratio,
-            max_regions=5,
-            optimal_layer=40
+            max_regions=max_regions,
+            optimal_layer=optimal_layer
         )
 
         # Store results
@@ -1643,24 +1643,44 @@ class GradioInterface:
         return segmented_image, f"Found {len(masks)} regions", gr.Dropdown(choices=choices, value=choices[0] if choices else None), region_preview
 
     def create_region_preview(self, image, mask, label=None):
-        """Creates a visualization of a single region"""
+        """Creates a visualization of a single region with enhanced visibility"""
         preview = image.copy()
+        
+        # Create a mask for highlighting
         mask_3d = np.stack([mask, mask, mask], axis=2)
-        highlighted = np.where(mask_3d, np.minimum(preview * 1.5, 255), preview * 0.4)
+        
+        # Make the region much brighter while dimming the surroundings
+        highlighted = np.where(mask_3d, np.minimum(preview * 1.8, 255), preview * 0.3)
 
+        # Find contours for drawing a border
         contours, _ = cv2.findContours(
             mask.astype(np.uint8),
             cv2.RETR_EXTERNAL,
             cv2.CHAIN_APPROX_SIMPLE
         )
-        cv2.drawContours(highlighted, contours, -1, (0, 255, 0), 2)
+        
+        # Draw a thicker green border around the region
+        cv2.drawContours(highlighted, contours, -1, (0, 255, 0), 3)
 
+        # Create the figure with a border
         fig, ax = plt.subplots(figsize=(5, 5))
         ax.imshow(highlighted.astype(np.uint8))
+        
+        # Show the label if provided
         if label:
-            ax.set_title(label)
-        ax.axis('off')
+            ax.set_title(label, fontsize=12, pad=10)
+            
+        # Add a border to the figure
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+            spine.set_linewidth(3)
+            spine.set_color('#01579b')  # Blue border color
+            
+        ax.axis('on')  # Show border
+        ax.tick_params(axis='both', which='both', bottom=False, top=False, left=False, right=False, 
+                      labelbottom=False, labelleft=False)  # Hide ticks but keep border
 
+        # Convert to image
         buf = io.BytesIO()
         fig.savefig(buf, format='png')
         buf.seek(0)
@@ -2081,8 +2101,15 @@ class GradioInterface:
                         print(f"[STATUS] Extracting region from bbox: {[x_min, y_min, x_max, y_max]}")
                         region = img[y_min:y_max, x_min:x_max]
                     
-                    # Display the region
+                    # Display the region with a highlight border
                     ax.imshow(region)
+                    
+                    # Add a border around the region to make it stand out
+                    border_width = 3  
+                    for spine in ax.spines.values():
+                        spine.set_visible(True)
+                        spine.set_linewidth(border_width)
+                        spine.set_color('#01579b')  # Blue border color
                     
                     # Get phrase if available
                     phrase = metadata.get("phrase", "Region")
@@ -2153,11 +2180,11 @@ class GradioInterface:
                 title = f"Result {i+1}: {score:.2f}"
                 ax.set_title(title, fontsize=12, pad=5)
                 
-                # Add filename with better visibility and positioning
+                # Add filename in a less obtrusive way - smaller text at the bottom
                 ax.text(0.5, 0.03, f"{filename}", transform=ax.transAxes, 
-                        ha='center', va='bottom', fontsize=10, 
-                        bbox=dict(facecolor='white', alpha=0.8, pad=3,
-                                  edgecolor='lightgray', boxstyle='round'))
+                        ha='center', va='bottom', fontsize=8, 
+                        bbox=dict(facecolor='white', alpha=0.6, pad=2,
+                                 edgecolor='lightgray', boxstyle='round'))
                 ax.axis('off')
 
             except Exception as e:
@@ -2184,7 +2211,7 @@ class GradioInterface:
         return results_image, "\n".join(result_info), gr.update(visible=True), gr.update(choices=radio_choices, value=None)
 
     def display_enlarged_result(self, result_selection):
-        """Displays an enlarged version of the selected search result"""
+        """Displays an enlarged version of the selected search result with region highlighted in full image"""
         if result_selection is None or not self.search_result_images:
             return None
             
@@ -2202,14 +2229,7 @@ class GradioInterface:
             if not isinstance(result_data, dict):
                 print(f"[WARNING] Unexpected result_data type: {type(result_data)}")
                 return None
-            
-            # Safely get image data
-            if "image" not in result_data:
-                print(f"[WARNING] No 'image' key in result_data: {list(result_data.keys())}")
-                return None
                 
-            region = result_data["image"]
-            
             # Safely handle metadata
             if "metadata" not in result_data:
                 print(f"[WARNING] No 'metadata' key in result_data: {list(result_data.keys())}")
@@ -2217,7 +2237,8 @@ class GradioInterface:
                 metadata = {
                     "filename": f"Result {result_idx+1}",
                     "phrase": "Unknown",
-                    "score": 0.0
+                    "score": 0.0,
+                    "image_source": None
                 }
             else:
                 metadata = result_data["metadata"]
@@ -2226,14 +2247,70 @@ class GradioInterface:
             filename = metadata.get("filename", f"Result {result_idx+1}")
             phrase = metadata.get("phrase", "Unknown")
             score = metadata.get("score", 0.0)
+            image_source = metadata.get("image_source", None)
+            result_type = metadata.get("type", "region")
             
             # Create a more visually appealing enlarged display
-            fig = plt.figure(figsize=(10, 8), constrained_layout=True)
+            fig = plt.figure(figsize=(12, 10), constrained_layout=True)
             gs = gridspec.GridSpec(1, 1, figure=fig)
             ax = fig.add_subplot(gs[0, 0])
             
-            # Display the image
-            ax.imshow(region)
+            # Load the full original image if we have a source
+            if image_source and os.path.exists(image_source):
+                try:
+                    # Load the full original image
+                    full_image = np.array(load_local_image(image_source))
+                    
+                    if result_type == "region":
+                        # Get bounding box if available
+                        bbox = result_data.get("bbox", None)
+                        
+                        # Create a copy of the image to draw on
+                        display_image = full_image.copy()
+                        
+                        # If we have a valid bounding box, highlight the region
+                        if bbox and len(bbox) == 4:
+                            x_min, y_min, x_max, y_max = bbox
+                            
+                            # Ensure bbox is within image bounds
+                            x_min = max(0, min(x_min, display_image.shape[1]-1))
+                            y_min = max(0, min(y_min, display_image.shape[0]-1))
+                            x_max = max(x_min+1, min(x_max, display_image.shape[1]))
+                            y_max = max(y_min+1, min(y_max, display_image.shape[0]))
+                            
+                            # Draw rectangle around region
+                            cv2.rectangle(display_image, 
+                                         (int(x_min), int(y_min)), 
+                                         (int(x_max), int(y_max)), 
+                                         (0, 255, 0), 3)
+                                         
+                            # Highlight the region slightly
+                            alpha = 0.3
+                            roi = display_image[y_min:y_max, x_min:x_max]
+                            highlighted_roi = np.clip(roi * 1.3, 0, 255).astype(np.uint8)
+                            display_image[y_min:y_max, x_min:x_max] = cv2.addWeighted(
+                                highlighted_roi, alpha, roi, 1-alpha, 0)
+                    else:
+                        # For whole image matches, just use the full image
+                        display_image = full_image
+                        
+                    # Show the full image with highlighted region
+                    ax.imshow(display_image)
+                except Exception as e:
+                    print(f"[WARNING] Error loading full image: {e}")
+                    # Fallback to the region image
+                    region = result_data.get("image", None)
+                    if region is not None:
+                        ax.imshow(region)
+            else:
+                # If no source image available, use the region image
+                region = result_data.get("image", None)
+                if region is not None:
+                    ax.imshow(region)
+                else:
+                    ax.text(0.5, 0.5, "Image not available", 
+                           ha='center', va='center', fontsize=14)
+            
             ax.axis('off')
             
             # Add a comprehensive, well-formatted title
@@ -2295,11 +2372,39 @@ class GradioInterface:
                         value="person, car, building"
                     )
                 
+                # Add parameter controls before the process button
+                with gr.Row():
+                    with gr.Column():
+                        embedding_layer = gr.Slider(
+                            minimum=1, maximum=50, value=40, step=1,
+                            label="Embedding Layer",
+                            info="Layer of the Perception Encoder to use for detection"
+                        )
+                    with gr.Column():
+                        min_area_ratio = gr.Slider(
+                            minimum=0.001, maximum=0.1, value=0.01, step=0.001,
+                            label="Minimum Area Ratio",
+                            info="Minimum size of regions to detect (as a fraction of image size)"
+                        )
+                    with gr.Column():
+                        max_regions = gr.Slider(
+                            minimum=1, maximum=20, value=5, step=1,
+                            label="Maximum Regions",
+                            info="Maximum number of regions to detect per image"
+                        )
+                
                 with gr.Row():
                     process_button = gr.Button("Detect Regions", variant="primary")
             
             # Whole-image mode components
             with gr.Group(visible=False) as whole_image_mode_group:
+                # Add embedding layer for whole image processing too
+                with gr.Row():
+                    whole_image_layer = gr.Slider(
+                        minimum=1, maximum=50, value=40, step=1,
+                        label="Embedding Layer",
+                        info="Layer of the Perception Encoder to use for processing"
+                    )
                 with gr.Row():
                     process_whole_button = gr.Button("Process Whole Image", variant="primary")
             
@@ -2325,14 +2430,7 @@ class GradioInterface:
                                     label="Max Results"
                                 )
                         
-                        # Add layer selection for search
-                        with gr.Row():
-                            embedding_layer = gr.Slider(
-                                minimum=1, maximum=50, value=40, step=1,
-                                label="Embedding Layer",
-                                info="Layer of the Perception Encoder to use for search (should match the database layer)"
-                            )
-                                
+                        # Remove the embedding layer slider from here since we moved it above
                         search_button = gr.Button("Search Similar Regions", variant="primary")
                     
                     # Results for whole-image mode
@@ -2393,7 +2491,7 @@ class GradioInterface:
             # Connect buttons to functions for region-based processing
             process_button.click(
                 self.process_image_with_prompt,
-                inputs=[input_image, text_prompt],
+                inputs=[input_image, text_prompt, min_area_ratio, max_regions, embedding_layer],
                 outputs=[segmented_output, detection_info, region_dropdown, region_preview]
             )
 
@@ -2412,7 +2510,7 @@ class GradioInterface:
             # Connect buttons to functions for whole-image processing
             process_whole_button.click(
                 self.process_whole_image,
-                inputs=[input_image, whole_embedding_layer],
+                inputs=[input_image, whole_image_layer],
                 outputs=[processed_output, whole_image_info]
             )
             
@@ -2542,6 +2640,21 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                                 value="person, car, building"
                             )
                             
+                            # Add region detection parameters
+                            with gr.Row():
+                                with gr.Column():
+                                    min_area_ratio = gr.Slider(
+                                        minimum=0.001, maximum=0.1, value=0.005, step=0.001,
+                                        label="Minimum Area Ratio",
+                                        info="Minimum size of regions to detect (as a fraction of image size)"
+                                    )
+                                with gr.Column():
+                                    max_regions = gr.Slider(
+                                        minimum=1, maximum=20, value=5, step=1,
+                                        label="Maximum Regions",
+                                        info="Maximum number of regions to detect per image"
+                                    )
+                            
                         # Common options for both modes
                         with gr.Row():
                             with gr.Column():
@@ -2568,7 +2681,7 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                 db_mode.change(toggle_region_options, inputs=[db_mode], outputs=[region_options_group])
                 
                 # Connect build database functions
-                def process_folder_with_mode(folder_path, collection_name, prompts, layer, mode):
+                def process_folder_with_mode(folder_path, collection_name, prompts, layer, mode, min_area_ratio=0.005, max_regions=5):
                     """Process folder based on selected mode"""
                     print(f"[STATUS] Starting folder processing with mode: {mode}")
                     # Set up a generator function to handle progress updates
@@ -2583,8 +2696,8 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                             prompts, 
                             collection_name,
                             optimal_layer=layer,
-                            min_area_ratio=0.005,
-                            max_regions=5
+                            min_area_ratio=min_area_ratio,
+                            max_regions=max_regions
                         )
                     else:
                         # Modify collection name to include mode and layer
@@ -2606,7 +2719,7 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                 
                 create_db_button.click(
                     process_folder_with_mode,
-                    inputs=[db_folder_path, db_collection_name, region_prompts, layer_slider, db_mode],
+                    inputs=[db_folder_path, db_collection_name, region_prompts, layer_slider, db_mode, min_area_ratio, max_regions],
                     outputs=[db_progress, db_done_msg]
                 )
             
@@ -2648,11 +2761,39 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                             value="person, car, building"
                         )
                     
+                    # Add parameter controls before the process button
+                    with gr.Row():
+                        with gr.Column():
+                            embedding_layer = gr.Slider(
+                                minimum=1, maximum=50, value=40, step=1,
+                                label="Embedding Layer",
+                                info="Layer of the Perception Encoder to use for detection"
+                            )
+                        with gr.Column():
+                            min_area_ratio = gr.Slider(
+                                minimum=0.001, maximum=0.1, value=0.01, step=0.001,
+                                label="Minimum Area Ratio",
+                                info="Minimum size of regions to detect (as a fraction of image size)"
+                            )
+                        with gr.Column():
+                            max_regions = gr.Slider(
+                                minimum=1, maximum=20, value=5, step=1,
+                                label="Maximum Regions",
+                                info="Maximum number of regions to detect per image"
+                            )
+                    
                     with gr.Row():
                         process_button = gr.Button("Detect Regions", variant="primary")
                 
                 # Whole-image mode components
                 with gr.Group(visible=False) as whole_image_mode_group:
+                    # Add embedding layer for whole image processing too
+                    with gr.Row():
+                        whole_image_layer = gr.Slider(
+                            minimum=1, maximum=50, value=40, step=1,
+                            label="Embedding Layer",
+                            info="Layer of the Perception Encoder to use for processing"
+                        )
                     with gr.Row():
                         process_whole_button = gr.Button("Process Whole Image", variant="primary")
                 
@@ -2678,14 +2819,7 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                                         label="Max Results"
                                     )
                             
-                            # Add layer selection for search
-                            with gr.Row():
-                                embedding_layer = gr.Slider(
-                                    minimum=1, maximum=50, value=40, step=1,
-                                    label="Embedding Layer",
-                                    info="Layer of the Perception Encoder to use for search (should match the database layer)"
-                                )
-                                    
+                            # Remove the embedding layer slider from here since we moved it above
                             search_button = gr.Button("Search Similar Regions", variant="primary")
                         
                         # Results for whole-image mode
@@ -2704,14 +2838,6 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                                         choices=["5", "10", "20", "50"], value="5",
                                         label="Max Results"
                                     )
-                            
-                            # Add layer selection for whole image search
-                            with gr.Row():
-                                whole_embedding_layer = gr.Slider(
-                                    minimum=1, maximum=50, value=40, step=1,
-                                    label="Embedding Layer",
-                                    info="Layer of the Perception Encoder to use for search (should match the database layer)"
-                                )
                                     
                             whole_search_button = gr.Button("Search Similar Images", variant="primary")
                         
@@ -2769,7 +2895,7 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                 # Connect buttons to functions for region-based processing
                 process_button.click(
                     interface.process_image_with_prompt,
-                    inputs=[input_image, text_prompt],
+                    inputs=[input_image, text_prompt, min_area_ratio, max_regions, embedding_layer],
                     outputs=[segmented_output, detection_info, region_dropdown, region_preview]
                 )
 
@@ -2788,13 +2914,13 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                 # Connect buttons to functions for whole-image processing
                 process_whole_button.click(
                     interface.process_whole_image,
-                    inputs=[input_image, whole_embedding_layer],
+                    inputs=[input_image, whole_image_layer],
                     outputs=[processed_output, whole_image_info]
                 )
                 
                 whole_search_button.click(
                     interface.search_whole_image,
-                    inputs=[whole_similarity_slider, whole_max_results_dropdown, whole_embedding_layer],
+                    inputs=[whole_similarity_slider, whole_max_results_dropdown, whole_image_layer],
                     outputs=[search_results_output, search_info, button_section, result_selector]
                 )
                 
