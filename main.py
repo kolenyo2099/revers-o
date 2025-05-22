@@ -58,11 +58,19 @@ class AppState:
         self.mode = "landing"  # "landing", "building", "searching"
         self.available_databases = []
         self.active_database = None
-        self.update_available_databases()
+        print(f"[STATUS] Initializing App State")
+        self.update_available_databases(verbose=False)
     
-    def update_available_databases(self):
+    def update_available_databases(self, verbose=True):
         """Update the list of available databases"""
+        if verbose:
+            print(f"[STATUS] Refreshing database list")
+        
         self.available_databases = list_available_databases()
+        
+        if verbose:
+            print(f"[STATUS] Found {len(self.available_databases)} databases")
+            
         return self.available_databases
 
 def list_available_databases():
@@ -74,16 +82,14 @@ def list_available_databases():
     collection_dir = os.path.join("image_retrieval_project", "qdrant_data", "collection")
     if os.path.exists(collection_dir):
         collections.extend([d for d in os.listdir(collection_dir) if os.path.isdir(os.path.join(collection_dir, d))])
-        print(f"[STATUS] Found collections in 'collection' directory: {collections}")
-    else:
-        print(f"[STATUS] Collection directory not found at: {collection_dir}")
+        print(f"[DEBUG] Found collections in 'collection' directory: {collections}")
     
     # Path 2: Check the 'collections' directory (plural)
     collections_dir = os.path.join("image_retrieval_project", "qdrant_data", "collections")
     if os.path.exists(collections_dir):
         plural_collections = [d for d in os.listdir(collections_dir) if os.path.isdir(os.path.join(collections_dir, d))]
         collections.extend(plural_collections)
-        print(f"[STATUS] Found collections in 'collections' directory: {plural_collections}")
+        print(f"[DEBUG] Found collections in 'collections' directory: {plural_collections}")
     
     # Path 3: Direct lookup in qdrant_data if neither subfolder exists
     if not collections:
@@ -95,9 +101,9 @@ def list_available_databases():
                 collection_list = client.get_collections().collections
                 collections = [c.name for c in collection_list]
                 client.close()
-                print(f"[STATUS] Found collections via Qdrant API: {collections}")
+                print(f"[DEBUG] Found collections via Qdrant API: {collections}")
             except Exception as e:
-                print(f"[STATUS] Error querying Qdrant API: {e}")
+                print(f"[DEBUG] Error querying Qdrant API: {e}")
     
     # Remove duplicates while preserving order
     unique_collections = []
@@ -106,9 +112,9 @@ def list_available_databases():
             unique_collections.append(c)
     
     if not unique_collections:
-        print(f"[STATUS] No collections found in any directory")
+        print(f"[STATUS] No database collections found")
     else:
-        print(f"[STATUS] Final available collections: {unique_collections}")
+        print(f"[STATUS] Available collections: {unique_collections}")
     
     return unique_collections
 
@@ -612,6 +618,167 @@ def extract_region_embeddings_autodistill(
 
         return None, [], [], [], []
 
+def extract_whole_image_embeddings(
+    image_source,
+    pe_model_param=None,
+    pe_vit_model_param=None,
+    preprocess_param=None,
+    device_param=None,
+    max_image_size=800,
+    optimal_layer=40
+):
+    """
+    Extract embeddings for whole images using only Perception Encoder without region detection
+    """
+    # Access global models if needed
+    global pe_model, pe_vit_model, preprocess, device
+    
+    # Use provided models or fall back to globals
+    pe_model_to_use = pe_model_param if pe_model_param is not None else pe_model
+    pe_vit_model_to_use = pe_vit_model_param if pe_vit_model_param is not None else pe_vit_model
+    preprocess_to_use = preprocess_param if preprocess_param is not None else preprocess
+    device_to_use = device_param if device_param is not None else device
+    
+    try:
+        print(f"[STATUS] Starting whole image embedding extraction...")
+        # Load the image
+        if isinstance(image_source, str):
+            if image_source.startswith(('http://', 'https://')):
+                print(f"[STATUS] Downloading image from URL...")
+                pil_image = download_image(image_source)
+            else:
+                print(f"[STATUS] Loading image from path: {os.path.basename(image_source)}")
+                pil_image = load_local_image(image_source)
+        else:
+            print(f"[STATUS] Processing uploaded image...")
+            pil_image = image_source
+
+        # Resize image to control memory usage
+        width, height = pil_image.size
+        if width > max_image_size or height > max_image_size:
+            if width > height:
+                new_width = max_image_size
+                new_height = int(height * (max_image_size / width))
+            else:
+                new_height = max_image_size
+                new_width = int(width * (max_image_size / height))
+
+            print(f"[STATUS] Resizing image from {width}x{height} to {new_width}x{new_height}")
+            pil_image = pil_image.resize((new_width, new_height), Image.LANCZOS)
+
+        # Convert to numpy array for processing
+        image = np.array(pil_image)
+        print(f"[STATUS] Image converted to array, shape: {image.shape}")
+
+        # Create metadata for the whole image
+        image_id = str(uuid.uuid4())
+        metadata = {
+            "region_id": image_id,
+            "image_source": str(image_source) if isinstance(image_source, str) else "uploaded_image",
+            "bbox": [0, 0, image.shape[1], image.shape[0]],  # Full image bbox
+            "area": image.shape[0] * image.shape[1],
+            "area_ratio": 1.0,  # Full image has area ratio of 1
+            "processing_type": "whole_image",  # Indicates this is a whole image, not a region
+            "embedding_method": "pe_encoder",
+            "layer_used": optimal_layer
+        }
+
+        # Process the image with PE model - using the SAME approach as in region processing
+        print(f"[STATUS] Processing image with Perception Encoder...")
+        
+        # Convert to PIL for model input
+        pil_img = Image.fromarray(image)
+        
+        # Process with PE model
+        with torch.no_grad():
+            # Convert to tensor in Float32 first (MPS compatibility)
+            pe_input = preprocess_to_use(pil_img).unsqueeze(0).to(device_to_use)
+            
+            # Try to get intermediate layer features using the same methods as region processing
+            features = None
+            embedding_method = "unknown"
+            
+            # Enable AMP for MPS if using PyTorch 2.0+
+            if torch.backends.mps.is_available() and hasattr(torch.amp, 'autocast'):
+                amp_context = torch.amp.autocast(device_type='mps', dtype=torch.float16)
+            else:
+                # Use a dummy context manager if autocast not available
+                amp_context = nullcontext()
+                
+            with amp_context:
+                # Method 1: Try using VisionTransformer if available (preferred)
+                if pe_vit_model_to_use is not None:
+                    try:
+                        # Use forward_features with layer_idx parameter
+                        features = pe_vit_model_to_use.forward_features(pe_input, layer_idx=optimal_layer)
+                        embedding_method = "vit_forward_features"
+                        print(f"[STATUS] Successfully extracted features using VisionTransformer forward_features")
+                    except Exception as e:
+                        print(f"[STATUS] Error using VisionTransformer forward_features: {e}")
+                        
+                # Method 2: Try using model.visual if it exists
+                if features is None and hasattr(pe_model_to_use, 'visual'):
+                    try:
+                        # Some vision transformers expose intermediate features
+                        if hasattr(pe_model_to_use.visual, 'transformer'):
+                            # Run forward pass and capture all intermediate activations
+                            output = pe_model_to_use.visual.transformer(
+                                pe_model_to_use.visual.conv1(pe_input),
+                                output_hidden_states=True
+                            )
+                            # Get the specific layer we want
+                            if isinstance(output, tuple) and len(output) > 1:
+                                # output[1] typically contains all hidden states
+                                hidden_states = output[1]
+                                if isinstance(hidden_states, list) and len(hidden_states) > optimal_layer:
+                                    features = hidden_states[optimal_layer]
+                                    embedding_method = "visual_transformer_hidden_states"
+                                    print(f"[STATUS] Successfully extracted features using visual transformer hidden states")
+                        
+                    except Exception as e:
+                        print(f"[STATUS] Error accessing visual transformer: {e}")
+                
+                # Method 3: Fallback to using the final output embedding if needed
+                if features is None:
+                    print(f"[STATUS] Could not access intermediate layer {optimal_layer}, using final output")
+                    features = pe_model_to_use.encode_image(pe_input)
+                    embedding_method = "encode_image_fallback"
+                    print(f"[STATUS] Successfully extracted features using encode_image fallback")
+            
+                # Process features based on their shape
+                if len(features.shape) == 3:  # [batch, sequence_length, embedding_dim]
+                    # For transformer features, we need to pool the token embeddings
+                    embedding = features.mean(dim=1)  # Average pooling over sequence
+                    print(f"[STATUS] Applied mean pooling over sequence dimension")
+                else:
+                    # If already pooled or a single vector
+                    embedding = features
+                
+                # Normalize embedding
+                embedding = torch.nn.functional.normalize(embedding, dim=-1)
+                print(f"[STATUS] Normalized embedding, shape: {embedding.shape}")
+            
+            # Update metadata with the method used
+            metadata["embedding_method"] = embedding_method
+            
+            # Move embedding to CPU
+            embedding_cpu = embedding.cpu()
+        
+        # Clean up CUDA/MPS memory if needed
+        if torch.backends.mps.is_available():
+            # For MPS (Metal), we need explicit synchronization
+            torch.mps.synchronize()  # Ensure all MPS operations are complete
+        
+        # Return results
+        print(f"[STATUS] Successfully extracted whole image embedding with shape: {embedding_cpu.shape}, method: {embedding_method}")
+        return image, embedding_cpu, metadata, "Whole Image"
+        
+    except Exception as e:
+        print(f"[ERROR] Error extracting whole image embedding: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None, None, None
+
 # =============================================================================
 # DATABASE FUNCTIONS
 # =============================================================================
@@ -629,26 +796,59 @@ def setup_qdrant(collection_name, vector_size):
         collection_names = [collection.name for collection in collections]
 
         if collection_name not in collection_names:
+            # Create the collection with standard vector configuration - no named vectors/multi-vectors
             client.create_collection(
                 collection_name=collection_name,
                 vectors_config=models.VectorParams(
                     size=vector_size,
                     distance=models.Distance.COSINE
+                ),
+                # Ensure we have proper indexing for fast search
+                optimizers_config=models.OptimizersConfigDiff(
+                    memmap_threshold=10000  # Use memmap for large collections
                 )
             )
             print(f"Created new collection: {collection_name}")
         else:
             print(f"Using existing collection: {collection_name}")
+            # Verify the collection has the correct vector size
+            collection_info = client.get_collection(collection_name=collection_name)
+            existing_vector_size = collection_info.config.params.vectors.size
+            if existing_vector_size != vector_size:
+                print(f"⚠️ Warning: Collection {collection_name} has vector size {existing_vector_size}, but requested size is {vector_size}")
+                print(f"This might cause issues when searching. Consider using a different collection name.")
 
         return client
     except Exception as e:
         print(f"Error in setup_qdrant: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def store_embeddings_in_qdrant(client, collection_name, embeddings, metadata_list):
     """Store embeddings in Qdrant collection"""
     try:
-        embedding_vectors = [emb.detach().cpu().numpy().tolist() for emb in embeddings]
+        # First, ensure all embeddings are in the correct format
+        embedding_vectors = []
+        for emb in embeddings:
+            # Check if embedding is already a tensor, get numpy array
+            if isinstance(emb, torch.Tensor):
+                emb_numpy = emb.detach().cpu().numpy()
+            else:
+                emb_numpy = np.array(emb)
+                
+            # If we have a 1D array with shape (D,), reshape to (1, D)
+            if len(emb_numpy.shape) == 1:
+                emb_vector = emb_numpy
+            # If we have a 2D array with shape (1, D), extract the inner vector
+            elif len(emb_numpy.shape) == 2 and emb_numpy.shape[0] == 1:
+                emb_vector = emb_numpy[0]
+            else:
+                # For any other shapes, flatten to ensure 1D
+                emb_vector = emb_numpy.flatten()
+                
+            embedding_vectors.append(emb_vector)
+
         point_ids = [metadata["region_id"] for metadata in metadata_list]
 
         # Convert numpy types in metadata to Python native types
@@ -670,7 +870,7 @@ def store_embeddings_in_qdrant(client, collection_name, embeddings, metadata_lis
                     sanitized[key] = value
             sanitized_metadata.append(sanitized)
 
-        # Prepare points for upsert
+        # Prepare points for upsert - make sure vectors are all the correct shape (1D only)
         points = []
         for i in range(len(embedding_vectors)):
             points.append(models.PointStruct(
@@ -688,12 +888,12 @@ def store_embeddings_in_qdrant(client, collection_name, embeddings, metadata_lis
                 points=batch
             )
 
-        client.get_collection(collection_name)
-
         print(f"Stored {len(points)} embeddings in Qdrant collection: {collection_name}")
         return point_ids
     except Exception as e:
         print(f"Error in store_embeddings_in_qdrant: {e}")
+        import traceback
+        traceback.print_exc()
         return []
 
 def visualize_detected_regions(image, masks, labels, title="Detected Regions", figsize=(10, 10)):
@@ -751,6 +951,7 @@ def process_folder_for_region_database(
     """Process all images in a folder and build a searchable database"""
     print(f"Starting to process folder: {folder_path}")
     print(f"Looking for objects matching: {text_prompts}")
+    print(f"Using embedding layer: {optimal_layer}")
 
     if not os.path.exists(folder_path):
         print(f"❌ Error: Folder not found at {folder_path}")
@@ -780,6 +981,10 @@ def process_folder_for_region_database(
     client = None
     vector_size = None
     initialization_complete = False
+    
+    # Include layer in collection name
+    region_collection = f"{collection_name}_layer{optimal_layer}"
+    print(f"📊 Using collection name with layer: {region_collection}")
 
     start_time = time.time()
 
@@ -810,7 +1015,7 @@ def process_folder_for_region_database(
                     vector_size = embeddings[0].shape[0]
                     print(f"📊 Vector dimension: {vector_size}")
 
-                    client = setup_qdrant(collection_name, vector_size)
+                    client = setup_qdrant(region_collection, vector_size)
                     if client is None:
                         print("❌ Failed to initialize Qdrant client.")
                         return None
@@ -818,7 +1023,7 @@ def process_folder_for_region_database(
                     initialization_complete = True
 
                 # Store embeddings
-                store_embeddings_in_qdrant(client, collection_name, embeddings, metadata)
+                store_embeddings_in_qdrant(client, region_collection, embeddings, metadata)
                 total_regions += len(embeddings)
                 processed_count += 1
             else:
@@ -845,6 +1050,115 @@ def process_folder_for_region_database(
     print(f"⏭️ Images skipped (no regions): {skipped_count}") 
     print(f"❌ Images failed: {failed_count}")
     print(f"📦 Total regions stored: {total_regions}")
+    print(f"📊 Embeddings created with layer: {optimal_layer}")
+
+    return client
+
+def process_folder_for_whole_image_database(
+    folder_path,
+    collection_name,
+    pe_model,
+    pe_vit_model, 
+    preprocess,
+    device,
+    optimal_layer=40,
+    checkpoint_interval=10,
+    resume_from_checkpoint=True
+):
+    """Process all images in a folder and build a searchable database of whole image embeddings"""
+    print(f"Starting to process folder for whole image embeddings: {folder_path}")
+
+    if not os.path.exists(folder_path):
+        print(f"❌ Error: Folder not found at {folder_path}")
+        return None
+
+    # Get all image files
+    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
+    image_paths = []
+
+    for file in os.listdir(folder_path):
+        if any(file.lower().endswith(ext) for ext in image_extensions):
+            image_paths.append(os.path.join(folder_path, file))
+
+    if not image_paths:
+        print(f"❌ Error: No images found in {folder_path}")
+        return None
+
+    print(f"📁 Found {len(image_paths)} images to process")
+
+    # Initialize tracking variables
+    processed_count = 0
+    failed_count = 0
+    total_images = 0
+
+    # Initialize database variables
+    client = None
+    vector_size = None
+    initialization_complete = False
+
+    start_time = time.time()
+
+    # Create a special collection name for whole images with layer information
+    whole_image_collection = f"{collection_name}_whole_images_layer{optimal_layer}"
+    print(f"📊 Using collection name: {whole_image_collection}")
+
+    # Process images
+    for idx, image_path in enumerate(image_paths):
+        print(f"\nProcessing image {idx+1}/{len(image_paths)}: {os.path.basename(image_path)}")
+
+        try:
+            # Extract whole image embedding
+            image, embedding, metadata, label = extract_whole_image_embeddings(
+                image_path,
+                pe_model_param=pe_model,
+                pe_vit_model_param=pe_vit_model,
+                preprocess_param=preprocess,
+                device_param=device,
+                optimal_layer=optimal_layer
+            )
+
+            if image is not None and embedding is not None:
+                print(f"✅ Successfully extracted embedding for image {idx+1}")
+
+                # Initialize database if not done yet
+                if not initialization_complete:
+                    vector_size = embedding.shape[1]
+                    print(f"📊 Vector dimension: {vector_size}")
+
+                    client = setup_qdrant(whole_image_collection, vector_size)
+                    if client is None:
+                        print("❌ Failed to initialize Qdrant client.")
+                        return None
+
+                    initialization_complete = True
+
+                # Store embedding
+                store_embeddings_in_qdrant(client, whole_image_collection, [embedding], [metadata])
+                total_images += 1
+                processed_count += 1
+            else:
+                print(f"⚠️ Failed to extract embedding for image {idx+1}, skipping")
+                failed_count += 1
+
+        except Exception as e:
+            print(f"❌ Error processing image {idx+1}: {e}")
+            failed_count += 1
+            continue
+
+        # Print progress
+        if (idx+1) % 5 == 0 or idx == len(image_paths) - 1:
+            elapsed_time = time.time() - start_time
+            print(f"\n📊 Progress: {idx+1}/{len(image_paths)} images, {total_images} total processed")
+            print(f"⏱️ Time elapsed: {elapsed_time:.1f}s")
+            print(f"✅ Processed: {processed_count}, ❌ Failed: {failed_count}")
+
+    # Print final statistics
+    elapsed_time = time.time() - start_time
+    print("\n📊 Processing Complete!")
+    print(f"⏱️ Total time: {elapsed_time:.1f}s")
+    print(f"🔍 Images processed: {processed_count}/{len(image_paths)}")
+    print(f"❌ Images failed: {failed_count}")
+    print(f"📊 Embeddings created with layer: {optimal_layer}")
 
     return client
 
@@ -1007,13 +1321,17 @@ def process_folder_with_progress_advanced(folder_path, prompts, collection_name,
         errors = 0
         total_regions = 0
         
+        # Use collection name provided (should already include layer info from caller)
+        collection_with_layer = collection_name
+        
         # Update Gradio with initial status
         yield (f"🔍 Starting to process {total} images in {folder_path}\n"
               f"📊 Parameters:\n"
               f"  - Semantic Layer: {optimal_layer}\n"
               f"  - Min Region Size: {min_area_ratio}\n"
               f"  - Max Regions: {max_regions}\n"
-              f"  - Resume from checkpoint: {resume_from_checkpoint}"), gr.update(visible=False)
+              f"  - Resume from checkpoint: {resume_from_checkpoint}\n"
+              f"  - Collection name: {collection_with_layer}"), gr.update(visible=False)
         
         print(f"[STATUS] Beginning image processing loop")
         for i, img_file in enumerate(image_files):
@@ -1046,11 +1364,15 @@ def process_folder_with_progress_advanced(folder_path, prompts, collection_name,
                     if client is None:
                         vector_size = embeddings[0].shape[0]
                         print(f"[STATUS] Setting up database with vector size {vector_size}")
-                        client = setup_qdrant(collection_name, vector_size)
+                        client = setup_qdrant(collection_with_layer, vector_size)
+                    
+                    # Add layer information to each region's metadata
+                    for md in metadata:
+                        md["embedding_layer"] = optimal_layer
                     
                     # Store embeddings
                     print(f"[STATUS] Storing {len(embeddings)} embeddings in database")
-                    store_embeddings_in_qdrant(client, collection_name, embeddings, metadata)
+                    store_embeddings_in_qdrant(client, collection_with_layer, embeddings, metadata)
                     processed += 1
                     total_regions += len(embeddings)
                 else:
@@ -1072,7 +1394,8 @@ def process_folder_with_progress_advanced(folder_path, prompts, collection_name,
                     f"🔍 Total regions found: {total_regions}\n\n"
                     f"🧠 Using semantic layer: {optimal_layer}\n"
                     f"🔍 Min region size: {min_area_ratio}\n"
-                    f"📏 Max regions per image: {max_regions}"
+                    f"📏 Max regions per image: {max_regions}\n"
+                    f"📦 Collection: {collection_with_layer}"
                 )
                 yield stats, gr.update(visible=i == total-1)
                 
@@ -1092,13 +1415,109 @@ def process_folder_with_progress_advanced(folder_path, prompts, collection_name,
             f"🧠 Semantic layer used: {optimal_layer}\n"
             f"🔍 Min region size: {min_area_ratio}\n"
             f"📏 Max regions per image: {max_regions}\n\n"
-            f"📦 Database collection: '{collection_name}'"
+            f"📦 Database collection: '{collection_with_layer}'"
         )
         print(f"[STATUS] {final_message}")
         return final_message, gr.update(visible=True)
     except Exception as e:
         error_message = f"❌ Error processing folder: {str(e)}"
         print(f"[ERROR] {error_message}")
+        import traceback
+        traceback.print_exc()
+        return error_message, gr.update(visible=False)
+
+def process_folder_with_progress_whole_images(folder_path, collection_name, 
+                                    optimal_layer=40, resume_from_checkpoint=True):
+    """Process folder with whole image embeddings for the UI"""
+    try:
+        print(f"[STATUS] Starting whole image processing for folder: {folder_path}")
+        print(f"[STATUS] Using collection: {collection_name}")
+        print(f"[STATUS] Using embedding layer: {optimal_layer}")
+        
+        # Get global model variables
+        global pe_model, pe_vit_model, preprocess, device
+        
+        # Get file list
+        image_files = [f for f in os.listdir(folder_path) 
+                      if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tiff'))]
+        total = len(image_files)
+        
+        print(f"[STATUS] Found {total} images to process in folder")
+        
+        if total == 0:
+            print(f"[STATUS] No images found in folder {folder_path}")
+            return "No images found in folder", gr.update(visible=False)
+        
+        # Process images with progress updates
+        client = None
+        processed = 0
+        errors = 0
+        
+        # Use collection name provided (should already include layer info from caller)
+        whole_image_collection = collection_name
+        
+        # Update Gradio with initial status
+        yield f"🔍 Starting to process {total} whole images in {folder_path}\n📊 Collection: {whole_image_collection}\n🧠 Using embedding layer: {optimal_layer}", gr.update(visible=False)
+        
+        print(f"[STATUS] Beginning whole image processing loop")
+        for i, img_file in enumerate(image_files):
+            # Process image
+            img_path = os.path.join(folder_path, img_file)
+            
+            # Yield progress update with percentage
+            progress_pct = ((i+1) / total) * 100
+            yield f"🔄 Processing: {i+1}/{total} images ({progress_pct:.1f}%)\n📄 Current: {img_file}", gr.update(visible=False)
+            
+            print(f"[STATUS] Processing image {i+1}/{total}: {img_file}")
+            
+            try:
+                # Extract whole image embedding
+                image, embedding, metadata, label = extract_whole_image_embeddings(
+                    img_path,
+                    pe_model,
+                    pe_vit_model,
+                    preprocess,
+                    device,
+                    optimal_layer=optimal_layer
+                )
+                
+                if image is not None and embedding is not None:
+                    print(f"[STATUS] Successfully extracted embedding for {img_file}")
+                    # Setup Qdrant client if needed
+                    if client is None:
+                        vector_size = embedding.shape[1]
+                        print(f"[STATUS] Setting up database with vector size {vector_size}")
+                        client = setup_qdrant(whole_image_collection, vector_size)
+                    
+                    # Store embedding
+                    print(f"[STATUS] Storing embedding in database")
+                    store_embeddings_in_qdrant(client, whole_image_collection, [embedding], [metadata])
+                    processed += 1
+                else:
+                    print(f"[STATUS] Failed to extract embedding for {img_file}")
+            except Exception as e:
+                print(f"[ERROR] Error processing {img_path}: {e}")
+                import traceback
+                traceback.print_exc()
+                errors += 1
+                
+            # Provide periodic updates
+            if (i+1) % 5 == 0 or i == len(image_files) - 1:
+                yield f"🔄 Processing: {i+1}/{total} images ({progress_pct:.1f}%)\n✅ Processed: {processed}\n❌ Errors: {errors}\n🧠 Using embedding layer: {optimal_layer}", gr.update(visible=False)
+        
+        # Final update
+        if processed > 0:
+            final_message = f"✅ Processing complete!\n📊 Processed {processed}/{total} images\n🗄️ Collection: {whole_image_collection}\n🧠 Using embedding layer: {optimal_layer}"
+            print(f"[STATUS] {final_message}")
+            return final_message, gr.update(visible=True)
+        else:
+            error_message = f"❌ Processing failed. No images were successfully processed."
+            print(f"[STATUS] {error_message}")
+            return error_message, gr.update(visible=False)
+        
+    except Exception as e:
+        error_message = f"❌ Error: {str(e)}"
+        print(f"[ERROR] Batch processing error: {e}")
         import traceback
         traceback.print_exc()
         return error_message, gr.update(visible=False)
@@ -1126,6 +1545,14 @@ class GradioInterface:
             "labels": []
         }
         
+        # Add whole image state
+        self.whole_image = {
+            "image": None,
+            "embedding": None,
+            "metadata": None,
+            "label": None
+        }
+        
         self.image_cache = {}
         self.search_result_images = []
         self.active_client = None
@@ -1143,6 +1570,11 @@ class GradioInterface:
     def set_active_collection(self, collection_name):
         """Set the active collection for search operations"""
         if collection_name and collection_name != "No databases found":
+            if collection_name == self.active_collection:
+                # No change needed
+                print(f"[DEBUG] Collection already set to {collection_name}")
+                return f"Using database: {collection_name}"
+                
             previous = self.active_collection
             self.active_collection = collection_name
             print(f"[STATUS] Changed active collection from {previous} to {collection_name}")
@@ -1153,8 +1585,8 @@ class GradioInterface:
                 self.active_client.close()
                 self.active_client = None
                 
-            return True
-        return False
+            return f"Set active database to: {collection_name}"
+        return "No database selected"
 
     def process_image_with_prompt(self, image, text_prompt, min_area_ratio=0.01):
         """Process an uploaded image with a text prompt to detect regions"""
@@ -1236,7 +1668,7 @@ class GradioInterface:
 
         return Image.open(buf)
 
-    def search_region(self, region_selection, similarity_threshold=0.5, max_results=5):
+    def search_region(self, region_selection, similarity_threshold=0.5, max_results=5, optimal_layer=40):
         """Search for similar regions based on the selected region's embedding"""
         print(f"[STATUS] Starting search for similar regions...")
         if region_selection is None or self.detected_regions["image"] is None:
@@ -1263,47 +1695,115 @@ class GradioInterface:
             else:
                 print(f"[STATUS] Using existing database connection")
             
-            collection_name = self.active_collection
-            print(f"[STATUS] Searching in collection: {collection_name}")
+            # Base collection name
+            base_collection_name = self.active_collection
             
-            # Verify collection exists
-            try:
-                collections = self.active_client.get_collections().collections
-                collection_names = [collection.name for collection in collections]
-                if collection_name not in collection_names:
-                    print(f"[ERROR] Collection {collection_name} not found. Available collections: {collection_names}")
-                    if collection_names:
-                        # Auto-switch to an available collection
-                        collection_name = collection_names[0]
-                        self.active_collection = collection_name
-                        print(f"[STATUS] Auto-switching to available collection: {collection_name}")
-                    else:
-                        return None, f"Error: Collection '{collection_name}' not found and no other collections are available.", gr.update(visible=False), gr.update(choices=[], value=None)
-            except Exception as e:
-                print(f"[ERROR] Error checking collections: {e}")
+            # Define the possible collection names to search
+            region_collection_name = f"{base_collection_name}_layer{optimal_layer}"
+            whole_image_collection_name = f"{base_collection_name}_whole_images_layer{optimal_layer}"
             
-            # Convert embedding to list for Qdrant
+            print(f"[STATUS] Looking for collections to search...")
+            
+            # Get available collections
+            collections = self.active_client.get_collections().collections
+            collection_names = [collection.name for collection in collections]
+            print(f"[STATUS] Available collections: {collection_names}")
+            
+            # Check if the specific collections exist
+            collections_to_search = []
+            collection_types = []
+            
+            # First, check region collection (primary for region search)
+            if region_collection_name in collection_names:
+                collections_to_search.append(region_collection_name)
+                collection_types.append("region")
+                print(f"[STATUS] Will search region collection: {region_collection_name}")
+            elif base_collection_name in collection_names:
+                collections_to_search.append(base_collection_name)
+                collection_types.append("region")
+                print(f"[STATUS] Will search base collection: {base_collection_name}")
+            
+            # Then, check whole image collection (secondary for region search)
+            if whole_image_collection_name in collection_names:
+                collections_to_search.append(whole_image_collection_name)
+                collection_types.append("whole_image")
+                print(f"[STATUS] Will also search whole image collection: {whole_image_collection_name}")
+            else:
+                # Look for any whole image collection as fallback
+                whole_image_collections = [c for c in collection_names if "whole_images" in c]
+                if whole_image_collections:
+                    collections_to_search.append(whole_image_collections[0])
+                    collection_types.append("whole_image")
+                    print(f"[STATUS] Will also search alternative whole image collection: {whole_image_collections[0]}")
+            
+            # If no collections found, return error
+            if not collections_to_search:
+                print(f"[ERROR] No suitable collections found to search")
+                return None, f"Error: No suitable collections found to search.", gr.update(visible=False), gr.update(choices=[], value=None)
+            
+            # Ensure parameters are the correct type
+            limit = int(max_results) if isinstance(max_results, str) else max_results
+            threshold = float(similarity_threshold) if isinstance(similarity_threshold, str) else similarity_threshold
+            
+            # Convert embedding to list for Qdrant - properly format as 1D vector
             print(f"[STATUS] Converting embedding to list format...")
-            embedding_list = embedding.cpu().numpy().tolist()
+            if len(embedding.shape) == 2 and embedding.shape[0] == 1:
+                # Extract the inner vector if shape is [1, D]
+                embedding_list = embedding[0].cpu().numpy().tolist()
+            else:
+                # Otherwise convert the tensor to a flattened list
+                embedding_list = embedding.cpu().numpy().flatten().tolist()
             
-            # Search for similar regions
-            print(f"[STATUS] Executing search with threshold {similarity_threshold}, max results {max_results}...")
-            search_results = self.active_client.search(
-                collection_name=collection_name,
-                query_vector=embedding_list,
-                limit=max_results,
-                score_threshold=similarity_threshold
+            # Search across all collections and gather results
+            all_results = []
+            
+            for i, collection_name in enumerate(collections_to_search):
+                collection_type = collection_types[i]
+                print(f"[STATUS] Searching collection: {collection_name} (type: {collection_type})...")
+                
+                try:
+                    # Set a higher limit to ensure we get enough results after combining
+                    collection_limit = limit * 2
+                    
+                    search_results = self.active_client.search(
+                        collection_name=collection_name,
+                        query_vector=embedding_list,
+                        limit=collection_limit,
+                        score_threshold=threshold
+                    )
+                    
+                    print(f"[STATUS] Found {len(search_results)} results in {collection_name}")
+                    
+                    # Tag results with their collection type
+                    for result in search_results:
+                        # Add collection info directly to payload
+                        if hasattr(result, "payload"):
+                            result.payload["collection_type"] = collection_type
+                            result.payload["collection_name"] = collection_name
+                    
+                    all_results.extend(search_results)
+                except Exception as e:
+                    print(f"[WARNING] Error searching collection {collection_name}: {e}")
+                    continue
+            
+            # Sort all results by score and limit to requested number
+            all_results.sort(key=lambda x: x.score, reverse=True)
+            filtered_results = all_results[:limit]
+            
+            print(f"[STATUS] Combined search complete, found {len(filtered_results)} results from {len(collections_to_search)} collections")
+            
+            if not filtered_results:
+                print(f"[STATUS] No similar items found above threshold {threshold}")
+                return None, f"No similar items found with similarity threshold {threshold}.", gr.update(visible=False), gr.update(choices=[], value=None)
+            
+            # Create visualization of combined results
+            return self.create_unified_search_results_visualization(
+                filtered_results, 
+                self.detected_regions["image"],
+                self.detected_regions["masks"][region_idx],
+                self.detected_regions["labels"][region_idx],
+                "region"
             )
-            
-            print(f"[STATUS] Search complete, found {len(search_results)} results")
-            
-            if not search_results:
-                print(f"[STATUS] No similar regions found above threshold {similarity_threshold}")
-                return None, f"No similar regions found with similarity threshold {similarity_threshold}.", gr.update(visible=False), gr.update(choices=[], value=None)
-
-            # Process search results
-            print(f"[STATUS] Creating visualization for {len(search_results)} search results...")
-            return self.create_search_results_visualization(search_results, region_idx)
         
         except Exception as e:
             error_message = f"Error searching for similar regions: {str(e)}"
@@ -1312,23 +1812,158 @@ class GradioInterface:
             traceback.print_exc()
             return None, error_message, gr.update(visible=False), gr.update(choices=[], value=None)
 
-    def create_search_results_visualization(self, filtered_results, query_region_idx):
-        """Create visualization of search results"""
-        print(f"[STATUS] Creating search results visualization for {len(filtered_results)} results...")
+    def search_whole_image(self, similarity_threshold=0.5, max_results=5, optimal_layer=40):
+        """Search for similar whole images based on the processed image's embedding"""
+        print(f"[STATUS] Starting search for similar whole images...")
+        if self.whole_image["image"] is None or self.whole_image["embedding"] is None:
+            print(f"[STATUS] No processed image available")
+            return None, "Please process an image first.", gr.update(visible=False), gr.update(choices=[], value=None)
+
+        # Check if the processed image used the same layer as requested for search
+        actual_layer = self.whole_image.get("layer_used", -1)
+        if actual_layer != optimal_layer:
+            print(f"[WARNING] Search layer ({optimal_layer}) doesn't match the layer used for processing ({actual_layer})")
+
+        # Get the embedding for the whole image
+        embedding = self.whole_image["embedding"]
+        print(f"[STATUS] Retrieved embedding for whole image, shape: {embedding.shape}")
+        
+        # Connect to Qdrant
+        try:
+            print(f"[STATUS] Connecting to vector database...")
+            if self.active_client is None:
+                self.active_client = QdrantClient(path="./image_retrieval_project/qdrant_data")
+                print(f"[STATUS] Created new database connection")
+            else:
+                print(f"[STATUS] Using existing database connection")
+            
+            # Base collection name
+            base_collection_name = self.active_collection
+            
+            # Define the possible collection names to search
+            region_collection_name = f"{base_collection_name}_layer{optimal_layer}"
+            whole_image_collection_name = f"{base_collection_name}_whole_images_layer{optimal_layer}"
+            
+            print(f"[STATUS] Looking for collections to search...")
+            
+            # Get available collections
+            collections = self.active_client.get_collections().collections
+            collection_names = [collection.name for collection in collections]
+            print(f"[STATUS] Available collections: {collection_names}")
+            
+            # Check if the specific collections exist
+            collections_to_search = []
+            collection_types = []
+            
+            # First, check whole image collection (primary for whole image search)
+            if whole_image_collection_name in collection_names:
+                collections_to_search.append(whole_image_collection_name)
+                collection_types.append("whole_image")
+                print(f"[STATUS] Will search whole image collection: {whole_image_collection_name}")
+            else:
+                # Look for any whole image collection as fallback
+                whole_image_collections = [c for c in collection_names if "whole_images" in c]
+                if whole_image_collections:
+                    collections_to_search.append(whole_image_collections[0])
+                    collection_types.append("whole_image")
+                    print(f"[STATUS] Will search alternative whole image collection: {whole_image_collections[0]}")
+            
+            # Then, check region collection (secondary for whole image search)
+            if region_collection_name in collection_names:
+                collections_to_search.append(region_collection_name)
+                collection_types.append("region")
+                print(f"[STATUS] Will also search region collection: {region_collection_name}")
+            elif base_collection_name in collection_names:
+                collections_to_search.append(base_collection_name)
+                collection_types.append("region")
+                print(f"[STATUS] Will also search base collection: {base_collection_name}")
+            
+            # If no collections found, return error
+            if not collections_to_search:
+                print(f"[ERROR] No suitable collections found to search")
+                return None, f"Error: No suitable collections found to search.", gr.update(visible=False), gr.update(choices=[], value=None)
+            
+            # Ensure parameters are the correct type
+            limit = int(max_results) if isinstance(max_results, str) else max_results
+            threshold = float(similarity_threshold) if isinstance(similarity_threshold, str) else similarity_threshold
+            
+            # Convert embedding to list for Qdrant - properly format as 1D vector
+            print(f"[STATUS] Converting embedding to list format...")
+            if len(embedding.shape) == 2 and embedding.shape[0] == 1:
+                # Extract the inner vector if shape is [1, D]
+                embedding_list = embedding[0].cpu().numpy().tolist()
+            else:
+                # Otherwise convert the tensor to a flattened list
+                embedding_list = embedding.cpu().numpy().flatten().tolist()
+            
+            # Search across all collections and gather results
+            all_results = []
+            
+            for i, collection_name in enumerate(collections_to_search):
+                collection_type = collection_types[i]
+                print(f"[STATUS] Searching collection: {collection_name} (type: {collection_type})...")
+                
+                try:
+                    # Set a higher limit to ensure we get enough results after combining
+                    collection_limit = limit * 2
+                    
+                    search_results = self.active_client.search(
+                        collection_name=collection_name,
+                        query_vector=embedding_list,
+                        limit=collection_limit,
+                        score_threshold=threshold
+                    )
+                    
+                    print(f"[STATUS] Found {len(search_results)} results in {collection_name}")
+                    
+                    # Tag results with their collection type
+                    for result in search_results:
+                        # Add collection info directly to payload
+                        if hasattr(result, "payload"):
+                            result.payload["collection_type"] = collection_type
+                            result.payload["collection_name"] = collection_name
+                    
+                    all_results.extend(search_results)
+                except Exception as e:
+                    print(f"[WARNING] Error searching collection {collection_name}: {e}")
+                    continue
+            
+            # Sort all results by score and limit to requested number
+            all_results.sort(key=lambda x: x.score, reverse=True)
+            filtered_results = all_results[:limit]
+            
+            print(f"[STATUS] Combined search complete, found {len(filtered_results)} results from {len(collections_to_search)} collections")
+            
+            if not filtered_results:
+                print(f"[STATUS] No similar items found above threshold {threshold}")
+                return None, f"No similar items found with similarity threshold {threshold}.", gr.update(visible=False), gr.update(choices=[], value=None)
+            
+            # Create visualization of combined results
+            return self.create_unified_search_results_visualization(
+                filtered_results, 
+                self.whole_image["image"],
+                None,  # No mask for whole image
+                "Whole Image",  # Label for whole image
+                "whole_image"
+            )
+        
+        except Exception as e:
+            error_message = f"Error searching for similar images: {str(e)}"
+            print(f"[ERROR] {error_message}")
+            import traceback
+            traceback.print_exc()
+            return None, error_message, gr.update(visible=False), gr.update(choices=[], value=None)
+
+    def create_unified_search_results_visualization(self, filtered_results, query_image, query_mask=None, query_label="Query", query_type="region"):
+        """Create visualization of search results with unified display for both region and whole image results"""
+        print(f"[STATUS] Creating unified search results visualization for {len(filtered_results)} results...")
         self.search_result_images = []
 
-        # Get query region info
-        query_label = self.detected_regions["labels"][query_region_idx]
-        query_mask = self.detected_regions["masks"][query_region_idx]
-        query_image = self.detected_regions["image"]
-        
-        print(f"[STATUS] Query region: {query_label}")
-        
         # Determine optimal grid layout based on number of results
         num_results = len(filtered_results)
         if num_results <= 3:
             grid_rows = 1
-            grid_cols = num_results
+            grid_cols = num_results 
         elif num_results <= 6:
             grid_rows = 2
             grid_cols = 3
@@ -1340,7 +1975,7 @@ class GradioInterface:
         fig_width = min(18, 6 + 3 * grid_cols)  # Limit max width
         fig_height = 4 + 3 * grid_rows
         
-        # Prepare figure for visualization - use a better layout system
+        # Prepare figure for visualization
         print(f"[STATUS] Setting up visualization figure with {grid_rows}x{grid_cols} grid...")
         fig = plt.figure(figsize=(fig_width, fig_height))
         
@@ -1349,9 +1984,29 @@ class GradioInterface:
         
         # Query section (top row, spans all columns)
         ax_query = fig.add_subplot(gs[0, :])
-        query_img = self.create_region_preview(query_image, query_mask)
-        ax_query.imshow(query_img)
-        ax_query.set_title(f"Query Region: {query_label}", fontsize=14, pad=10)
+        
+        # Display the query differently based on type
+        if query_type == "region" and query_mask is not None:
+            # For regions, highlight the region in the query image
+            highlighted = query_image.copy()
+            mask_3d = np.stack([query_mask, query_mask, query_mask], axis=2)
+            highlighted = np.where(mask_3d, np.minimum(highlighted * 1.5, 255), highlighted * 0.4)
+            
+            # Add contour
+            contours, _ = cv2.findContours(
+                query_mask.astype(np.uint8),
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE
+            )
+            cv2.drawContours(highlighted, contours, -1, (0, 255, 0), 2)
+            
+            ax_query.imshow(highlighted.astype(np.uint8))
+            ax_query.set_title(f"Query Region: {query_label}", fontsize=14, pad=10)
+        else:
+            # For whole images, just show the image
+            ax_query.imshow(query_image)
+            ax_query.set_title(f"Query: {query_label}", fontsize=14, pad=10)
+            
         ax_query.axis('off')
 
         # Create radio choices for result selection
@@ -1376,11 +2031,14 @@ class GradioInterface:
                 # Extract metadata
                 metadata = result.payload
                 image_source = metadata.get("image_source", "Unknown")
-                bbox = metadata.get("bbox", [0, 0, 100, 100])
-                phrase = metadata.get("phrase", "Unknown")
                 score = result.score
                 
-                print(f"[STATUS] Result {i+1} - Source: {os.path.basename(image_source) if isinstance(image_source, str) else 'embedded_image'}, Score: {score:.4f}")
+                # Get collection type (region or whole_image)
+                collection_type = metadata.get("collection_type", "unknown")
+                collection_name = metadata.get("collection_name", "unknown")
+                
+                print(f"[STATUS] Result {i+1} - Source: {os.path.basename(image_source) if isinstance(image_source, str) else 'embedded_image'}, "
+                      f"Score: {score:.4f}, Type: {collection_type}")
                 
                 # Get filename for display
                 if isinstance(image_source, str):
@@ -1394,50 +2052,118 @@ class GradioInterface:
                     img = self.image_cache[image_source]
                 else:
                     print(f"[STATUS] Loading image from {filename}")
-                    img = np.array(load_local_image(image_source))
-                    self.image_cache[image_source] = img
+                    try:
+                        img = np.array(load_local_image(image_source))
+                        self.image_cache[image_source] = img
+                    except Exception as e:
+                        print(f"[WARNING] Could not load image {filename}: {e}")
+                        ax.text(0.5, 0.5, f"Error loading image", ha='center', va='center')
+                        ax.axis('off')
+                        continue
 
-                # Extract region using bbox
-                x_min, y_min, x_max, y_max = bbox
-                print(f"[STATUS] Extracting region from bbox: {bbox}")
-                region = img[y_min:y_max, x_min:x_max]
+                # Display the result differently based on collection type
+                if collection_type == "region":
+                    # Extract and display region using bbox
+                    bbox = metadata.get("bbox", [0, 0, 100, 100])
+                    x_min, y_min, x_max, y_max = bbox
+                    
+                    # Ensure bbox is within image bounds
+                    if x_min >= img.shape[1] or y_min >= img.shape[0]:
+                        print(f"[WARNING] Invalid bbox for {filename}: {bbox}")
+                        region = img  # Show whole image as fallback
+                    else:
+                        # Clip values to image bounds
+                        x_min = max(0, min(x_min, img.shape[1]-1))
+                        y_min = max(0, min(y_min, img.shape[0]-1))
+                        x_max = max(x_min+1, min(x_max, img.shape[1]))
+                        y_max = max(y_min+1, min(y_max, img.shape[0]))
+                        
+                        print(f"[STATUS] Extracting region from bbox: {[x_min, y_min, x_max, y_max]}")
+                        region = img[y_min:y_max, x_min:x_max]
+                    
+                    # Display the region
+                    ax.imshow(region)
+                    
+                    # Get phrase if available
+                    phrase = metadata.get("phrase", "Region")
+                    
+                    # Create a badge showing it's a region
+                    badge_props = dict(boxstyle="round,pad=0.3", fc="#e1f5fe", ec="#01579b", alpha=0.8)
+                    badge_text = "REGION"
+                    ax.text(0.04, 0.04, badge_text, transform=ax.transAxes, 
+                            fontsize=9, weight='bold', color='#01579b',
+                            verticalalignment='top', horizontalalignment='left',
+                            bbox=badge_props)
+                    
+                    # Store region for possible enlargement
+                    self.search_result_images.append({
+                        "image": region,
+                        "bbox": bbox,
+                        "metadata": {
+                            "image_source": image_source,
+                            "filename": filename,
+                            "phrase": phrase,
+                            "score": score,
+                            "type": "region",
+                            "collection_name": collection_name
+                        }
+                    })
+                    
+                    # Create radio choice label
+                    choice_label = f"Result {i+1}: {filename} - {phrase} (Region)"
+                    
+                    # Add to result info text
+                    result_info.append(f"**Result {i+1}:** {filename}\n- Type: Region\n- Phrase: {phrase}\n- Score: {score:.4f}\n")
+                    
+                else:  # whole_image
+                    # Display the whole image
+                    ax.imshow(img)
+                    
+                    # Create a badge showing it's a whole image
+                    badge_props = dict(boxstyle="round,pad=0.3", fc="#e8f5e9", ec="#2e7d32", alpha=0.8)
+                    badge_text = "WHOLE IMAGE"
+                    ax.text(0.04, 0.04, badge_text, transform=ax.transAxes, 
+                            fontsize=9, weight='bold', color='#2e7d32',
+                            verticalalignment='top', horizontalalignment='left',
+                            bbox=badge_props)
+                    
+                    # Store whole image for possible enlargement
+                    self.search_result_images.append({
+                        "image": img,
+                        "metadata": {
+                            "image_source": image_source,
+                            "filename": filename,
+                            "phrase": "Whole Image",
+                            "score": score,
+                            "type": "whole_image",
+                            "collection_name": collection_name
+                        }
+                    })
+                    
+                    # Create radio choice label
+                    choice_label = f"Result {i+1}: {filename} (Whole Image)"
+                    
+                    # Add to result info text
+                    result_info.append(f"**Result {i+1}:** {filename}\n- Type: Whole Image\n- Score: {score:.4f}\n")
                 
-                # Display region with improved labeling
-                ax.imshow(region)
+                # Add to radio choices
+                radio_choices.append(choice_label)
                 
                 # Create a clearer title with result number and score
                 title = f"Result {i+1}: {score:.2f}"
                 ax.set_title(title, fontsize=12, pad=5)
                 
                 # Add filename with better visibility and positioning
-                # Use a semi-transparent background for better text readability
                 ax.text(0.5, 0.03, f"{filename}", transform=ax.transAxes, 
                         ha='center', va='bottom', fontsize=10, 
                         bbox=dict(facecolor='white', alpha=0.8, pad=3,
                                   edgecolor='lightgray', boxstyle='round'))
                 ax.axis('off')
 
-                # Create radio button choice with comprehensive information
-                choice_label = f"Result {i+1}: {filename} - {phrase}"
-                radio_choices.append(choice_label)
-                
-                # Add to result info text with more details
-                result_info.append(f"**Result {i+1}:** {filename}\n- Phrase: {phrase}\n- Score: {score:.4f}\n")
-                
-                # Store region for possible enlargement
-                self.search_result_images.append({
-                    "image": region,
-                    "bbox": bbox,
-                    "metadata": {
-                        "image_source": image_source,
-                        "filename": filename,
-                        "phrase": phrase,
-                        "score": score
-                    }
-                })
-
             except Exception as e:
                 print(f"[ERROR] Error displaying result {i+1}: {e}")
+                import traceback
+                traceback.print_exc()
                 ax.text(0.5, 0.5, f"Error loading image {i+1}", ha='center', va='center')
                 ax.axis('off')
                 self.search_result_images.append(None)
@@ -1471,8 +2197,35 @@ class GradioInterface:
                 
             # Get the selected result data
             result_data = self.search_result_images[result_idx]
+            
+            # Check if result_data is a dictionary (expected format)
+            if not isinstance(result_data, dict):
+                print(f"[WARNING] Unexpected result_data type: {type(result_data)}")
+                return None
+            
+            # Safely get image data
+            if "image" not in result_data:
+                print(f"[WARNING] No 'image' key in result_data: {list(result_data.keys())}")
+                return None
+                
             region = result_data["image"]
-            metadata = result_data["metadata"]
+            
+            # Safely handle metadata
+            if "metadata" not in result_data:
+                print(f"[WARNING] No 'metadata' key in result_data: {list(result_data.keys())}")
+                # Create default metadata
+                metadata = {
+                    "filename": f"Result {result_idx+1}",
+                    "phrase": "Unknown",
+                    "score": 0.0
+                }
+            else:
+                metadata = result_data["metadata"]
+                
+            # Get metadata values safely with defaults
+            filename = metadata.get("filename", f"Result {result_idx+1}")
+            phrase = metadata.get("phrase", "Unknown")
+            score = metadata.get("score", 0.0)
             
             # Create a more visually appealing enlarged display
             fig = plt.figure(figsize=(10, 8), constrained_layout=True)
@@ -1484,13 +2237,13 @@ class GradioInterface:
             ax.axis('off')
             
             # Add a comprehensive, well-formatted title
-            title = f"Result {result_idx+1}: {metadata['filename']}"
+            title = f"Result {result_idx+1}: {filename}"
             ax.set_title(title, fontsize=16, pad=15)
             
             # Add detailed metadata information in a visually appealing box
             info_text = (
-                f"Phrase: {metadata['phrase']}\n"
-                f"Score: {metadata['score']:.4f}"
+                f"Phrase: {phrase}\n"
+                f"Score: {score:.4f}" if isinstance(score, (float, int)) else f"Score: {score}"
             )
             
             # Create a text box with better styling
@@ -1509,7 +2262,231 @@ class GradioInterface:
             
         except Exception as e:
             print(f"[ERROR] Error displaying enlarged result: {e}")
+            import traceback
+            traceback.print_exc()
             return None
+
+    def build_interface(self):
+        """Build the Gradio interface"""
+        # Create the interface with tabs for different modes
+        with gr.Blocks(title="Grounded SAM Region Search") as demo:
+            gr.Markdown("# 🔍 Grounded SAM Region Search")
+            gr.Markdown("Upload an image, detect regions, and search for similar regions in your image database.")
+
+            # Processing mode selector (new)
+            gr.Markdown("## Processing Mode")
+            with gr.Row():
+                processing_mode = gr.Radio(
+                    choices=["Region Detection (GroundedSAM + PE)", "Whole Image (PE Only)"],
+                    value="Region Detection (GroundedSAM + PE)",
+                    label="Select Processing Mode"
+                )
+            
+            # Common file upload for both modes
+            with gr.Row():
+                input_image = gr.Image(type="pil", label="Upload Image")
+            
+            # Region-based mode components
+            with gr.Group(visible=True) as region_mode_group:
+                with gr.Row():
+                    text_prompt = gr.Textbox(
+                        placeholder="person, car, building, sign, text, animal, food",
+                        label="Detection Prompts (comma-separated)",
+                        value="person, car, building"
+                    )
+                
+                with gr.Row():
+                    process_button = gr.Button("Detect Regions", variant="primary")
+            
+            # Whole-image mode components
+            with gr.Group(visible=False) as whole_image_mode_group:
+                with gr.Row():
+                    process_whole_button = gr.Button("Process Whole Image", variant="primary")
+            
+            # Status and results area
+            with gr.Row():
+                with gr.Column():
+                    # Results for region-based mode
+                    with gr.Group(visible=True) as region_results_group:
+                        detection_info = gr.Textbox(label="Detection Status")
+                        segmented_output = gr.Image(type="pil", label="Detected Regions")
+                        region_dropdown = gr.Dropdown(choices=[], label="Select a Region")
+                        region_preview = gr.Image(type="pil", label="Region Preview")
+                        
+                        with gr.Row():
+                            with gr.Column():
+                                similarity_slider = gr.Slider(
+                                    minimum=0.0, maximum=1.0, value=0.5, step=0.01,
+                                    label="Similarity Threshold"
+                                )
+                            with gr.Column():
+                                max_results_dropdown = gr.Dropdown(
+                                    choices=["5", "10", "20", "50"], value="5",
+                                    label="Max Results"
+                                )
+                        
+                        # Add layer selection for search
+                        with gr.Row():
+                            embedding_layer = gr.Slider(
+                                minimum=1, maximum=50, value=40, step=1,
+                                label="Embedding Layer",
+                                info="Layer of the Perception Encoder to use for search (should match the database layer)"
+                            )
+                                
+                        search_button = gr.Button("Search Similar Regions", variant="primary")
+                    
+                    # Results for whole-image mode
+                    with gr.Group(visible=False) as whole_image_results_group:
+                        whole_image_info = gr.Textbox(label="Processing Status")
+                        processed_output = gr.Image(type="pil", label="Processed Image")
+                        
+                        with gr.Row():
+                            with gr.Column():
+                                whole_similarity_slider = gr.Slider(
+                                    minimum=0.0, maximum=1.0, value=0.5, step=0.01,
+                                    label="Similarity Threshold"
+                                )
+                            with gr.Column():
+                                whole_max_results_dropdown = gr.Dropdown(
+                                    choices=["5", "10", "20", "50"], value="5",
+                                    label="Max Results"
+                                )
+                        
+                        # Add layer selection for whole image search
+                        with gr.Row():
+                            whole_embedding_layer = gr.Slider(
+                                minimum=1, maximum=50, value=40, step=1,
+                                label="Embedding Layer",
+                                info="Layer of the Perception Encoder to use for search (should match the database layer)"
+                            )
+                                
+                        whole_search_button = gr.Button("Search Similar Images", variant="primary")
+                    
+                    # Common search results area
+                    search_info = gr.Textbox(label="Search Status")
+                    search_results_output = gr.Image(type="pil", label="Search Results")
+                    
+                    with gr.Group(visible=False) as button_section:
+                        result_selector = gr.Dropdown(choices=[], label="Select Result to View")
+                    
+                    enlarged_result = gr.Image(type="pil", label="Enlarged Result")
+            
+            # Function to toggle visibility based on mode
+            def toggle_mode(mode):
+                if mode == "Region Detection (GroundedSAM + PE)":
+                    return gr.update(visible=True), gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
+                else:  # Whole Image mode
+                    return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)
+            
+            # Connect mode selector to toggle visibility
+            processing_mode.change(
+                toggle_mode,
+                inputs=[processing_mode],
+                outputs=[
+                    region_mode_group, 
+                    whole_image_mode_group,
+                    region_results_group,
+                    whole_image_results_group
+                ]
+            )
+            
+            # Connect buttons to functions for region-based processing
+            process_button.click(
+                self.process_image_with_prompt,
+                inputs=[input_image, text_prompt],
+                outputs=[segmented_output, detection_info, region_dropdown, region_preview]
+            )
+
+            region_dropdown.change(
+                self.update_region_preview,
+                inputs=[region_dropdown],
+                outputs=[region_preview]
+            )
+
+            search_button.click(
+                self.search_region,
+                inputs=[region_dropdown, similarity_slider, max_results_dropdown, embedding_layer],
+                outputs=[search_results_output, search_info, button_section, result_selector]
+            )
+            
+            # Connect buttons to functions for whole-image processing
+            process_whole_button.click(
+                self.process_whole_image,
+                inputs=[input_image, whole_embedding_layer],
+                outputs=[processed_output, whole_image_info]
+            )
+            
+            whole_search_button.click(
+                self.search_whole_image,
+                inputs=[whole_similarity_slider, whole_max_results_dropdown, whole_embedding_layer],
+                outputs=[search_results_output, search_info, button_section, result_selector]
+            )
+            
+            # Connect result selector for both modes
+            result_selector.change(
+                self.display_enlarged_result,
+                inputs=[result_selector],
+                outputs=[enlarged_result]
+            )
+
+        return demo
+
+    def process_whole_image(self, image, optimal_layer=40):
+        """Process an uploaded image using only PE Encoder without region detection"""
+        if isinstance(image, np.ndarray):
+            image_pil = Image.fromarray(image)
+        else:
+            image_pil = image
+
+        print(f"[STATUS] Processing whole image with embedding layer: {optimal_layer}")
+            
+        # Extract whole image embedding
+        image_np, embedding, metadata, label = extract_whole_image_embeddings(
+            image_pil,
+            pe_model_param=self.pe_model,
+            pe_vit_model_param=self.pe_vit_model,
+            preprocess_param=self.preprocess,
+            device_param=self.device,
+            optimal_layer=optimal_layer
+        )
+
+        # Store results
+        self.whole_image = {
+            "image": image_np,
+            "embedding": embedding,
+            "metadata": metadata,
+            "label": label,
+            "layer_used": optimal_layer
+        }
+
+        if embedding is None:
+            return image_np, "Failed to process image"
+
+        # Create a simple visualization with border
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.imshow(image_np)
+        ax.set_title(f"Whole Image Processed (Layer {optimal_layer})")
+        # Add a green border to show it's been processed
+        border_width = 5
+        plt.gca().spines['top'].set_linewidth(border_width)
+        plt.gca().spines['bottom'].set_linewidth(border_width)
+        plt.gca().spines['left'].set_linewidth(border_width)
+        plt.gca().spines['right'].set_linewidth(border_width)
+        plt.gca().spines['top'].set_color('green')
+        plt.gca().spines['bottom'].set_color('green')
+        plt.gca().spines['left'].set_color('green')
+        plt.gca().spines['right'].set_color('green')
+        ax.axis('on')  # Show axis for border visibility
+        ax.tick_params(axis='both', which='both', bottom=False, top=False, left=False, right=False, labelbottom=False, labelleft=False)
+        
+        # Save figure to buffer
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png')
+        buf.seek(0)
+        plt.close(fig)
+
+        processed_image = Image.open(buf)
+        return processed_image, f"Image processed successfully using layer {optimal_layer}"
 
     def update_region_preview(self, region_selection):
         """Updates the region preview when a region is selected"""
@@ -1522,403 +2499,343 @@ class GradioInterface:
 
         return self.create_region_preview(self.detected_regions["image"], mask, label)
 
-    def build_interface(self):
-        """Build the search interface"""
-        with gr.Blocks(title="Grounded SAM Region Search") as interface:
-            # Interface title and description
-            gr.Markdown("# Grounded SAM Region Search Interface")
-            gr.Markdown("Upload an image, specify a text prompt to detect regions, select a region, and search for similar regions in the database.")
-            
-            # Add status indicator at the top
-            status_indicator = gr.Markdown("**Status:** Ready")
-            
-            with gr.Row():
-                with gr.Column(scale=1):
-                    # Input components
-                    input_image = gr.Image(label="Upload Image", type="pil")
-                    text_prompt = gr.Textbox(
-                        label="Text Prompt (e.g., 'person, car, building')",
-                        placeholder="Enter objects to detect...",
-                        value="person, car, building, chair, table"
-                    )
-                    process_button = gr.Button("Detect Regions")
-
-                    # Region selection
-                    region_dropdown = gr.Dropdown(label="Select a Region", choices=[])
-                    region_preview = gr.Image(label="Selected Region Preview")
-
-                    # Search controls
-                    similarity_slider = gr.Slider(
-                        minimum=0.0,
-                        maximum=1.0,
-                        value=0.5,
-                        step=0.05,
-                        label="Similarity Threshold",
-                        info="Only show results with similarity score ≥ this value"
-                    )
-
-                    max_results_dropdown = gr.Dropdown(
-                        label="Number of Results to Display",
-                        choices=[1, 2, 3, 4, 5, 6, 8, 10],
-                        value=5,
-                        info="Maximum number of similar regions to display"
-                    )
-
-                    search_button = gr.Button("Search Similar Regions")
-                    
-                    # Collection info
-                    collection_info = gr.Textbox(
-                        label="Active Collection",
-                        value=f"Current database: {self.active_collection}",
-                        interactive=False
-                    )
-
-                with gr.Column(scale=2):
-                    # Output components
-                    segmented_output = gr.Image(label="Detected Regions")
-                    detection_info = gr.Textbox(label="Detection Info")
-
-                    # Search results
-                    search_results_output = gr.Image(label="Search Results")
-                    search_info = gr.Markdown(label="Search Results Info")
-
-                    # Result selection
-                    with gr.Column(visible=False) as results_section:
-                        gr.Markdown("## Select Result to View Details")
-                        result_dropdown = gr.Dropdown(
-                            label="Select a result to see details",
-                            choices=[],
-                            interactive=True
-                        )
-                        
-                        # Add enlarged result display
-                        enlarged_result = gr.Image(label="Enlarged Result View", visible=True)
-
-            # Function to update status indicator
-            def update_status(message):
-                return f"**Status:** {message}"
-                
-            # Modified process_image_with_prompt that updates status
-            def process_image_with_status(image, text_prompt):
-                status_indicator.value = update_status("Detecting regions... please wait")
-                result = self.process_image_with_prompt(image, text_prompt)
-                status_indicator.value = update_status("Region detection complete")
-                return result
-                
-            # Modified search_region that updates status
-            def search_with_status(region_selection, similarity_threshold, max_results):
-                status_indicator.value = update_status("Searching for similar regions... please wait")
-                result = self.search_region(region_selection, similarity_threshold, max_results)
-                status_indicator.value = update_status("Search complete")
-                return result
-
-            # Event handlers with status updates
-            process_button.click(
-                fn=process_image_with_status,
-                inputs=[input_image, text_prompt],
-                outputs=[segmented_output, detection_info, region_dropdown, region_preview]
-            )
-
-            region_dropdown.change(
-                fn=self.update_region_preview,
-                inputs=[region_dropdown],
-                outputs=[region_preview]
-            )
-
-            search_button.click(
-                fn=search_with_status,
-                inputs=[region_dropdown, similarity_slider, max_results_dropdown],
-                outputs=[search_results_output, search_info, results_section, result_dropdown]
-            )
-            
-            # Add handler for result selection
-            result_dropdown.change(
-                self.display_enlarged_result,
-                inputs=[result_dropdown],
-                outputs=[enlarged_result]
-            )
-
-            # Help section at the bottom
-            gr.Markdown("## Instructions:")
-            gr.Markdown("""
-            1. Upload an image using the panel on the left
-            2. Enter a text prompt describing objects you want to detect (e.g., 'person, car, building')
-            3. Click 'Detect Regions' to process the image (this may take a few moments)
-            4. Select one of the detected regions from the dropdown
-            5. Adjust the similarity threshold if needed (higher = more similar)
-            6. Click 'Search Similar Regions' to find similar regions (this may take a few moments)
-            7. View search results and select individual results for details
-            """)
-
-        return interface
-
 # =============================================================================
 # MULTI-MODE INTERFACE
 # =============================================================================
 
-def show_landing_page(app_state=None):
-    """Switch to landing page mode"""
-    if app_state:
-        app_state.mode = "landing"
-    return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)
-
-def show_build_interface(app_state=None):
-    """Switch to database building mode"""
-    if app_state:
-        app_state.mode = "building"
-    return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
-
-def show_search_interface(app_state=None):
-    """Switch to search interface mode"""
-    if app_state:
-        app_state.mode = "searching"
-    return gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)
-
-def select_database(database_name, app_state=None):
-    """Select and activate a database for searching"""
-    if database_name and database_name != "No databases found" and app_state:
-        app_state.active_database = database_name
-        return database_name
-    return None
-
 def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
-    """Create the multi-mode interface with landing page, database builder, and search interface"""
+    """Create a multi-mode interface with both region-based and whole-image processing"""
+    # Initialize the app state to track databases
     app_state = AppState()
-    search_interface = GradioInterface(pe_model, pe_vit_model, preprocess, device)
     
+    # Initialize the interface with the models
+    interface = GradioInterface(pe_model, pe_vit_model, preprocess, device)
+    
+    # Create a comprehensive multi-mode Gradio interface with tabs
     with gr.Blocks(title="Grounded SAM Region Search") as demo:
-        # Landing Page Section
-        with gr.Column(visible=True) as landing_section:
-            gr.Markdown("# Grounded SAM Region Search")
-            gr.Markdown("### Choose an operation mode:")
-            with gr.Row():
-                create_db_btn = gr.Button("Create New Database", size="large")
-                search_db_btn = gr.Button("Search Existing Database", size="large")
+        gr.Markdown("# 🔍 Grounded SAM Region Search")
         
-        # Database Builder Section
-        with gr.Column(visible=False) as builder_section:
-            gr.Markdown("# Database Builder")
-            with gr.Row():
-                folder_input = gr.Textbox(label="Image Folder Path", value="./my_images")
-                prompts_input = gr.Textbox(label="Detection Prompts", value="person, building, car, text, object")
-            with gr.Row():
-                collection_input = gr.Textbox(label="Database Name", value="grounded_image_regions")
-            
-            # New advanced parameters section
-            with gr.Accordion("Advanced Parameters", open=False):
+        # Create mode tabs
+        with gr.Tabs() as tabs:
+            # Tab 1: Create Database
+            with gr.TabItem("Create Database"):
+                gr.Markdown("## Create a New Database")
+                gr.Markdown("Process images in a folder to create a searchable database.")
+                
                 with gr.Row():
-                    optimal_layer = gr.Slider(
-                        minimum=1,
-                        maximum=50,
-                        value=40,
-                        step=1,
-                        label="Semantic Layer (1-50)",
-                        info="Higher layers capture more abstract concepts, lower layers capture more visual details"
-                    )
-                with gr.Row():
-                    min_area_ratio = gr.Slider(
-                        minimum=0.001,
-                        maximum=0.1,
-                        value=0.005,
-                        step=0.001,
-                        label="Minimum Region Size",
-                        info="Smaller values detect smaller regions (as fraction of image size)"
-                    )
-                with gr.Row():
-                    max_regions = gr.Slider(
-                        minimum=1,
-                        maximum=20,
-                        value=5,
-                        step=1,
-                        label="Maximum Regions Per Image",
-                        info="Maximum number of regions to extract from each image"
-                    )
-                with gr.Row():
-                    resume_checkbox = gr.Checkbox(
-                        value=True,
-                        label="Resume from checkpoint if available",
-                        info="Continue from last processed image if interrupted"
-                    )
-            
-            start_btn = gr.Button("Start Processing")
-            progress_output = gr.Textbox(label="Progress", interactive=False)
-            back_to_menu_btn1 = gr.Button("Back to Main Menu")
-            go_to_search_btn = gr.Button("Go to Search", visible=False)
-        
-        # Search Interface Section
-        with gr.Column(visible=False) as search_section:
-            gr.Markdown("# Search Interface")
-            
-            # Get fresh list of available databases
-            available_dbs = list_available_databases()
-            
-            # Database selection at the top with refresh button
-            with gr.Row():
-                database_dropdown = gr.Dropdown(
-                    label="Select Database", 
-                    choices=available_dbs if available_dbs else ["No databases found"],
-                    value=available_dbs[0] if available_dbs else None,
-                    interactive=True
-                )
-                refresh_dbs_btn = gr.Button("🔄 Refresh Database List")
-            
-            # Active database indicator
-            active_db_indicator = gr.Markdown(
-                f"**Active Database:** {search_interface.active_collection if search_interface.active_collection else 'None'}"
-            )
-            
-            # Include search interface components
-            with gr.Row():
-                with gr.Column(scale=1):
-                    input_image = gr.Image(label="Upload Image", type="pil")
-                    text_prompt = gr.Textbox(
-                        label="Text Prompt (e.g., 'person, car, building')",
-                        placeholder="Enter objects to detect...",
-                        value="person, car, building, chair, table, computer, phone, book"
-                    )
-                    process_button = gr.Button("Detect Regions")
-
-                    region_dropdown = gr.Dropdown(label="Select a Region", choices=[])
-                    region_preview = gr.Image(label="Selected Region Preview")
-
-                    similarity_slider = gr.Slider(
-                        minimum=0.0,
-                        maximum=1.0,
-                        value=0.5,
-                        step=0.05,
-                        label="Similarity Threshold"
-                    )
-
-                    max_results_dropdown = gr.Dropdown(
-                        label="Number of Results to Display",
-                        choices=[1, 2, 3, 4, 5, 6, 8, 10],
-                        value=5
-                    )
-
-                    search_button = gr.Button("Search Similar Regions")
-
-                with gr.Column(scale=2):
-                    segmented_output = gr.Image(label="Detected Regions")
-                    detection_info = gr.Textbox(label="Detection Info")
-
-                    search_results_output = gr.Image(label="Search Results")
-                    search_info = gr.Textbox(label="Search Results Info", max_lines=8)
-
-                    with gr.Column(visible=False) as button_section:
-                        gr.Markdown("## Enlarge Results")
-                        result_selector = gr.Radio(
-                            label="Select a result to enlarge",
-                            choices=[],
-                            value=None
+                    with gr.Column():
+                        db_folder_path = gr.Textbox(label="Image Folder Path", placeholder="/path/to/images")
+                        db_collection_name = gr.Textbox(label="Database Name", value="my_image_database", 
+                                                      placeholder="Name for your database collection")
+                        
+                        db_mode = gr.Radio(
+                            choices=["Region Detection (GroundedSAM + PE)", "Whole Image (PE Only)"],
+                            value="Region Detection (GroundedSAM + PE)",
+                            label="Database Processing Mode"
                         )
                         
-                        # Add enlarged result display
-                        enlarged_result = gr.Image(label="Enlarged Result View", visible=True)
-            
-            back_to_menu_btn2 = gr.Button("Back to Main Menu")
-            
-            # Function to refresh database list
-            def refresh_databases():
-                fresh_dbs = list_available_databases()
-                return gr.update(
-                    choices=fresh_dbs if fresh_dbs else ["No databases found"],
-                    value=fresh_dbs[0] if fresh_dbs else None
+                        # Region-specific options
+                        with gr.Group(visible=True) as region_options_group:
+                            region_prompts = gr.Textbox(
+                                placeholder="person, car, building, sign, text, animal, food",
+                                label="Detection Prompts (comma-separated)",
+                                value="person, car, building"
+                            )
+                            
+                        # Common options for both modes
+                        with gr.Row():
+                            with gr.Column():
+                                layer_slider = gr.Slider(
+                                    minimum=1, maximum=50, value=40, step=1,
+                                    label="Embedding Layer",
+                                    info="Layer of the Perception Encoder to use (1-50)"
+                                )
+                        
+                        # Process button
+                        create_db_button = gr.Button("Process Folder & Create Database", variant="primary")
+                    
+                    with gr.Column():
+                        db_progress = gr.Textbox(label="Processing Status")
+                        db_done_msg = gr.Markdown(visible=False)
+                        
+                # Function to toggle region options based on mode
+                def toggle_region_options(mode):
+                    if mode == "Region Detection (GroundedSAM + PE)":
+                        return gr.update(visible=True)
+                    else:
+                        return gr.update(visible=False)
+                
+                db_mode.change(toggle_region_options, inputs=[db_mode], outputs=[region_options_group])
+                
+                # Connect build database functions
+                def process_folder_with_mode(folder_path, collection_name, prompts, layer, mode):
+                    """Process folder based on selected mode"""
+                    print(f"[STATUS] Starting folder processing with mode: {mode}")
+                    # Set up a generator function to handle progress updates
+                    
+                    if mode == "Region Detection (GroundedSAM + PE)":
+                        # Modify collection name to include mode and layer
+                        collection_name = f"{collection_name}_layer{layer}"
+                        print(f"[STATUS] Using region collection name: {collection_name}")
+                        # Process with region detection
+                        gen = process_folder_with_progress_advanced(
+                            folder_path, 
+                            prompts, 
+                            collection_name,
+                            optimal_layer=layer,
+                            min_area_ratio=0.005,
+                            max_regions=5
+                        )
+                    else:
+                        # Modify collection name to include mode and layer
+                        collection_name = f"{collection_name}_whole_images_layer{layer}"
+                        print(f"[STATUS] Using whole image collection name: {collection_name}")
+                        # Process with whole image
+                        gen = process_folder_with_progress_whole_images(
+                            folder_path,
+                            collection_name,
+                            optimal_layer=layer
+                        )
+                    
+                    # Return first message
+                    result = next(gen)
+                    
+                    # Process remaining generator values 
+                    for message, done_visible in gen:
+                        yield message, gr.update(visible=done_visible)
+                
+                create_db_button.click(
+                    process_folder_with_mode,
+                    inputs=[db_folder_path, db_collection_name, region_prompts, layer_slider, db_mode],
+                    outputs=[db_progress, db_done_msg]
                 )
             
-            # Function to update active database indicator
-            def update_active_db_indicator(db_name):
-                success = search_interface.set_active_collection(db_name)
-                if success:
-                    return f"**Active Database:** {db_name}"
-                else:
-                    return f"**Active Database:** {search_interface.active_collection}"
-            
-            # Connect event handlers for search interface
-            process_button.click(
-                search_interface.process_image_with_prompt,
-                inputs=[input_image, text_prompt],
-                outputs=[segmented_output, detection_info, region_dropdown, region_preview]
-            )
+            # Tab 2: Search Database
+            with gr.TabItem("Search Database"):
+                gr.Markdown("## Search Database")
+                gr.Markdown("Upload an image, detect regions, and search for similar regions in your database.")
+                
+                # Database selection
+                with gr.Row():
+                    with gr.Column():
+                        # Refresh button for database list
+                        refresh_db_button = gr.Button("Refresh Database List")
+                    with gr.Column():
+                        db_dropdown = gr.Dropdown(
+                            choices=app_state.available_databases if app_state.available_databases else ["No databases found"],
+                            value=app_state.available_databases[0] if app_state.available_databases else None,
+                            label="Select Database"
+                        )
+                
+                # Processing mode selector
+                with gr.Row():
+                    processing_mode = gr.Radio(
+                        choices=["Region Detection (GroundedSAM + PE)", "Whole Image (PE Only)"],
+                        value="Region Detection (GroundedSAM + PE)",
+                        label="Select Processing Mode"
+                    )
+                
+                # Common file upload for both modes
+                with gr.Row():
+                    input_image = gr.Image(type="pil", label="Upload Image")
+                
+                # Region-based mode components
+                with gr.Group(visible=True) as region_mode_group:
+                    with gr.Row():
+                        text_prompt = gr.Textbox(
+                            placeholder="person, car, building, sign, text, animal, food",
+                            label="Detection Prompts (comma-separated)",
+                            value="person, car, building"
+                        )
+                    
+                    with gr.Row():
+                        process_button = gr.Button("Detect Regions", variant="primary")
+                
+                # Whole-image mode components
+                with gr.Group(visible=False) as whole_image_mode_group:
+                    with gr.Row():
+                        process_whole_button = gr.Button("Process Whole Image", variant="primary")
+                
+                # Status and results area
+                with gr.Row():
+                    with gr.Column():
+                        # Results for region-based mode
+                        with gr.Group(visible=True) as region_results_group:
+                            detection_info = gr.Textbox(label="Detection Status")
+                            segmented_output = gr.Image(type="pil", label="Detected Regions")
+                            region_dropdown = gr.Dropdown(choices=[], label="Select a Region")
+                            region_preview = gr.Image(type="pil", label="Region Preview")
+                            
+                            with gr.Row():
+                                with gr.Column():
+                                    similarity_slider = gr.Slider(
+                                        minimum=0.0, maximum=1.0, value=0.5, step=0.01,
+                                        label="Similarity Threshold"
+                                    )
+                                with gr.Column():
+                                    max_results_dropdown = gr.Dropdown(
+                                        choices=["5", "10", "20", "50"], value="5",
+                                        label="Max Results"
+                                    )
+                            
+                            # Add layer selection for search
+                            with gr.Row():
+                                embedding_layer = gr.Slider(
+                                    minimum=1, maximum=50, value=40, step=1,
+                                    label="Embedding Layer",
+                                    info="Layer of the Perception Encoder to use for search (should match the database layer)"
+                                )
+                                    
+                            search_button = gr.Button("Search Similar Regions", variant="primary")
+                        
+                        # Results for whole-image mode
+                        with gr.Group(visible=False) as whole_image_results_group:
+                            whole_image_info = gr.Textbox(label="Processing Status")
+                            processed_output = gr.Image(type="pil", label="Processed Image")
+                            
+                            with gr.Row():
+                                with gr.Column():
+                                    whole_similarity_slider = gr.Slider(
+                                        minimum=0.0, maximum=1.0, value=0.5, step=0.01,
+                                        label="Similarity Threshold"
+                                    )
+                                with gr.Column():
+                                    whole_max_results_dropdown = gr.Dropdown(
+                                        choices=["5", "10", "20", "50"], value="5",
+                                        label="Max Results"
+                                    )
+                            
+                            # Add layer selection for whole image search
+                            with gr.Row():
+                                whole_embedding_layer = gr.Slider(
+                                    minimum=1, maximum=50, value=40, step=1,
+                                    label="Embedding Layer",
+                                    info="Layer of the Perception Encoder to use for search (should match the database layer)"
+                                )
+                                    
+                            whole_search_button = gr.Button("Search Similar Images", variant="primary")
+                        
+                        # Common search results area
+                        search_info = gr.Textbox(label="Search Status")
+                        search_results_output = gr.Image(type="pil", label="Search Results")
+                        
+                        with gr.Group(visible=False) as button_section:
+                            result_selector = gr.Dropdown(choices=[], label="Select Result to View")
+                        
+                        enlarged_result = gr.Image(type="pil", label="Enlarged Result")
+                
+                # Function to toggle visibility based on mode
+                def toggle_mode(mode):
+                    if mode == "Region Detection (GroundedSAM + PE)":
+                        return gr.update(visible=True), gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
+                    else:  # Whole Image mode
+                        return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)
+                
+                # Connect mode selector to toggle visibility
+                processing_mode.change(
+                    toggle_mode,
+                    inputs=[processing_mode],
+                    outputs=[
+                        region_mode_group, 
+                        whole_image_mode_group,
+                        region_results_group,
+                        whole_image_results_group
+                    ]
+                )
+                
+                # Function to refresh database list
+                def refresh_databases():
+                    app_state.update_available_databases(verbose=True)
+                    if app_state.available_databases:
+                        print(f"[STATUS] Updated dropdown with {len(app_state.available_databases)} databases")
+                        return gr.Dropdown(choices=app_state.available_databases, value=app_state.available_databases[0])
+                    else:
+                        print(f"[STATUS] No databases found to display in dropdown")
+                        return gr.Dropdown(choices=["No databases found"], value=None)
+                
+                # Connect refresh button
+                refresh_db_button.click(refresh_databases, inputs=[], outputs=[db_dropdown])
+                
+                # Function to set active database
+                def set_active_database(collection_name):
+                    if collection_name and collection_name != "No databases found":
+                        interface.set_active_collection(collection_name)
+                        return f"Set active database to: {collection_name}"
+                    return "No database selected"
+                
+                # Connect database dropdown
+                db_dropdown.change(set_active_database, inputs=[db_dropdown], outputs=[detection_info])
+                
+                # Connect buttons to functions for region-based processing
+                process_button.click(
+                    interface.process_image_with_prompt,
+                    inputs=[input_image, text_prompt],
+                    outputs=[segmented_output, detection_info, region_dropdown, region_preview]
+                )
 
-            region_dropdown.change(
-                search_interface.update_region_preview,
-                inputs=[region_dropdown],
-                outputs=[region_preview]
-            )
+                region_dropdown.change(
+                    interface.update_region_preview,
+                    inputs=[region_dropdown],
+                    outputs=[region_preview]
+                )
 
-            search_button.click(
-                search_interface.search_region,
-                inputs=[region_dropdown, similarity_slider, max_results_dropdown],
-                outputs=[search_results_output, search_info, button_section, result_selector]
-            )
+                search_button.click(
+                    interface.search_region,
+                    inputs=[region_dropdown, similarity_slider, max_results_dropdown, embedding_layer],
+                    outputs=[search_results_output, search_info, button_section, result_selector]
+                )
+                
+                # Connect buttons to functions for whole-image processing
+                process_whole_button.click(
+                    interface.process_whole_image,
+                    inputs=[input_image, whole_embedding_layer],
+                    outputs=[processed_output, whole_image_info]
+                )
+                
+                whole_search_button.click(
+                    interface.search_whole_image,
+                    inputs=[whole_similarity_slider, whole_max_results_dropdown, whole_embedding_layer],
+                    outputs=[search_results_output, search_info, button_section, result_selector]
+                )
+                
+                # Connect result selector for both modes
+                result_selector.change(
+                    interface.display_enlarged_result,
+                    inputs=[result_selector],
+                    outputs=[enlarged_result]
+                )
             
-            # Add handler for result selection in multi-mode interface
-            result_selector.change(
-                search_interface.display_enlarged_result,
-                inputs=[result_selector],
-                outputs=[enlarged_result]
-            )
-            
-            # Database selection and refresh handlers
-            refresh_dbs_btn.click(
-                fn=refresh_databases,
-                inputs=None,
-                outputs=[database_dropdown]
-            )
-            
-            database_dropdown.change(
-                fn=update_active_db_indicator,
-                inputs=[database_dropdown],
-                outputs=[active_db_indicator]
-            )
-        
-        # Event handlers for mode switching
-        create_db_btn.click(
-            fn=show_build_interface,
-            inputs=None,
-            outputs=[landing_section, builder_section, search_section]
-        )
-        
-        search_db_btn.click(
-            fn=show_search_interface,
-            inputs=None, 
-            outputs=[landing_section, builder_section, search_section]
-        )
-        
-        back_to_menu_btn1.click(
-            fn=show_landing_page,
-            inputs=None,
-            outputs=[landing_section, builder_section, search_section]
-        )
-        
-        back_to_menu_btn2.click(
-            fn=show_landing_page,
-            inputs=None,
-            outputs=[landing_section, builder_section, search_section]
-        )
-        
-        # Modified processing functionality with advanced parameters
-        start_btn.click(
-            fn=process_folder_with_progress_advanced,
-            inputs=[
-                folder_input, 
-                prompts_input, 
-                collection_input,
-                optimal_layer,
-                min_area_ratio,
-                max_regions,
-                resume_checkbox
-            ],
-            outputs=[progress_output, go_to_search_btn]
-        )
-        
-        go_to_search_btn.click(
-            fn=show_search_interface,
-            inputs=None,
-            outputs=[landing_section, builder_section, search_section]
-        )
-
-        return demo
+            # Tab 3: About
+            with gr.TabItem("About"):
+                gr.Markdown("""
+                # Grounded SAM Region Search
+                
+                This application combines GroundedSAM for region detection and Perception Encoder (PE) for embedding generation to create a powerful semantic image search system.
+                
+                ## Features
+                
+                - **Region Detection Mode**: Extract meaningful regions from images using GroundedSAM, then embed them with PE
+                - **Whole Image Mode**: Process entire images directly with PE for faster processing
+                - **Cross-Compatible Search**: Search across both region and whole image databases
+                - **Flexible Database Management**: Create and search multiple databases
+                
+                ## How to Use
+                
+                1. **Create Database tab**: Process folders of images to build your search database
+                2. **Search Database tab**: Upload and process images to find similar content in your database
+                
+                ## Technical Details
+                
+                - Built with GroundedSAM, Perception Encoder, and Qdrant vector database
+                - Supports various semantic layer depths for different types of features
+                - Cross-compatible between region detection and whole-image processing modes
+                """)
+    
+    # Set the default active database if available
+    if app_state.available_databases:
+        interface.set_active_collection(app_state.available_databases[0])
+    
+    return demo
 
 # =============================================================================
 # MAIN FUNCTION
@@ -1935,6 +2852,12 @@ def main():
     parser.add_argument("--collection", default="grounded_image_regions", help="Qdrant collection name")
     parser.add_argument("--new-interface", action="store_true", help="Use the new multi-mode interface (deprecated, now the default)")
     parser.add_argument("--legacy-interface", action="store_true", help="Use the legacy single-mode interface")
+    # Add mode option
+    parser.add_argument("--mode", choices=["region", "whole_image"], default="region", 
+                        help="Processing mode: 'region' for GroundedSAM+PE or 'whole_image' for PE only")
+    parser.add_argument("--optimal-layer", type=int, default=40, help="Optimal layer for PE model (default: 40)")
+    # Add port option
+    parser.add_argument("--port", type=int, default=7860, help="Port to use for the Gradio interface")
 
     args = parser.parse_args()
 
@@ -1962,7 +2885,36 @@ def main():
         print("\n🌐 Launching multi-mode interface with both build and search functionality...")
         demo = create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device)
         print("🚀 Interface ready! Opening in browser...")
-        demo.launch(share=False, server_name="127.0.0.1", server_port=7860)
+        
+        # Try to launch with different ports to avoid port conflicts
+        import socket
+        import os
+        
+        # First attempt to kill any existing process on the port
+        os.system(f"lsof -ti:{args.port} | xargs kill -9 2>/dev/null || true")
+        
+        # Function to check if a port is in use
+        def is_port_in_use(port):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                return s.connect_ex(('localhost', port)) == 0
+        
+        # Try ports sequentially
+        max_port = args.port + 10
+        current_port = args.port
+        
+        while current_port <= max_port:
+            if not is_port_in_use(current_port):
+                try:
+                    print(f"Trying to start server on port {current_port}...")
+                    demo.launch(share=False, server_name="127.0.0.1", server_port=current_port)
+                    return  # If successful, exit the function
+                except OSError:
+                    print(f"Failed to start on port {current_port}")
+            current_port += 1
+        
+        # If all ports failed, try without specifying a port
+        print("All specified ports are in use. Letting Gradio choose an available port...")
+        demo.launch(share=False)
         return
 
     # Legacy command-line mode (only if explicitly requested)
@@ -1979,22 +2931,38 @@ def main():
             print(f"Please create the folder and add images, or specify a different folder with --folder")
             return
 
-        client = process_folder_for_region_database(
-            folder_path=args.folder,
-            collection_name=args.collection,
-            text_prompts=args.prompts,
-            pe_model=pe_model,
-            pe_vit_model=pe_vit_model,
-            preprocess=preprocess,
-            device=device,
-            optimal_layer=40,
-            min_area_ratio=0.005,
-            max_regions=5,
-            visualize_samples=False,  # Disable for non-interactive mode
-            sample_count=2,
-            checkpoint_interval=3,
-            resume_from_checkpoint=True
-        )
+        # Choose processing mode based on argument
+        if args.mode == "whole_image":
+            print(f"📊 Processing Mode: Whole Image (PE Only)")
+            client = process_folder_for_whole_image_database(
+                folder_path=args.folder,
+                collection_name=args.collection,
+                pe_model=pe_model,
+                pe_vit_model=pe_vit_model,
+                preprocess=preprocess,
+                device=device,
+                optimal_layer=args.optimal_layer,
+                checkpoint_interval=3,
+                resume_from_checkpoint=True
+            )
+        else:  # Default to region mode
+            print(f"📊 Processing Mode: Region Detection (GroundedSAM + PE)")
+            client = process_folder_for_region_database(
+                folder_path=args.folder,
+                collection_name=args.collection,
+                text_prompts=args.prompts,
+                pe_model=pe_model,
+                pe_vit_model=pe_vit_model,
+                preprocess=preprocess,
+                device=device,
+                optimal_layer=args.optimal_layer,
+                min_area_ratio=0.005,
+                max_regions=5,
+                visualize_samples=False,  # Disable for non-interactive mode
+                sample_count=2,
+                checkpoint_interval=3,
+                resume_from_checkpoint=True
+            )
 
         if client is not None:
             print("✅ Database built successfully!")
@@ -2012,7 +2980,36 @@ def main():
         demo = interface.build_interface()
         
         print("🚀 Interface ready! Opening in browser...")
-        demo.launch(share=False, server_name="127.0.0.1", server_port=7860)
+        
+        # Try to launch with different ports to avoid port conflicts
+        import socket
+        import os
+        
+        # First attempt to kill any existing process on the port
+        os.system(f"lsof -ti:{args.port} | xargs kill -9 2>/dev/null || true")
+        
+        # Function to check if a port is in use
+        def is_port_in_use(port):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                return s.connect_ex(('localhost', port)) == 0
+        
+        # Try ports sequentially
+        max_port = args.port + 10
+        current_port = args.port
+        
+        while current_port <= max_port:
+            if not is_port_in_use(current_port):
+                try:
+                    print(f"Trying to start server on port {current_port}...")
+                    demo.launch(share=False, server_name="127.0.0.1", server_port=current_port)
+                    return  # If successful, exit the function
+                except OSError:
+                    print(f"Failed to start on port {current_port}")
+            current_port += 1
+        
+        # If all ports failed, try without specifying a port
+        print("All specified ports are in use. Letting Gradio choose an available port...")
+        demo.launch(share=False)
 
 if __name__ == "__main__":
     main()
