@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Setup script for Grounded SAM Region Search
+Setup script for Revers-o: GroundedSAM + Perception Encoders Image Similarity Search
 This handles the special setup steps that can't be done via requirements.txt
 """
 
@@ -52,26 +52,46 @@ def setup_perception_models():
         with open(requirements_file, 'r') as file:
             content = file.read()
         
-        # Replace decord with eva-decord
+        # Replace decord with eva-decord for cross-platform compatibility
         new_content = content.replace('decord==0.6.0', 'eva-decord==0.6.1')
+        
+        # Handle other potential compatibility issues
+        new_content = new_content.replace('decord>=0.6.0', 'eva-decord==0.6.1')
+        new_content = new_content.replace('decord', 'eva-decord==0.6.1')
         
         with open(requirements_file, 'w') as file:
             file.write(new_content)
         
-        print("✅ Modified requirements.txt to use eva-decord for Apple Silicon compatibility")
+        print("✅ Modified requirements.txt to use eva-decord for cross-platform compatibility")
     
-    # Install the perception_models package
-    os.chdir('./perception_models')
-    success = run_command(
-        "pip install -e .",
-        "Installing perception_models package"
-    )
-    os.chdir('..')
+    # Install the perception_models package with better error handling
+    original_dir = os.getcwd()
+    try:
+        os.chdir('./perception_models')
+        
+        # Try to install with pip first
+        success = run_command(
+            "pip install -e .",
+            "Installing perception_models package"
+        )
+        
+        # If that fails, try with specific Python executable
+        if not success:
+            import sys
+            python_exec = sys.executable
+            success = run_command(
+                f"{python_exec} -m pip install -e .",
+                "Installing perception_models package with explicit Python executable"
+            )
+            
+    finally:
+        os.chdir(original_dir)
     
     if success:
         print("✅ perception_models setup completed successfully")
     else:
         print("❌ Failed to install perception_models package")
+        print("💡 Try running: pip install -e ./perception_models manually")
     
     return success
 
@@ -91,7 +111,7 @@ def create_directories():
 
 def main():
     """Main setup function"""
-    print("🚀 Setting up Grounded SAM Region Search Application")
+    print("🚀 Setting up Revers-o: GroundedSAM + Perception Encoders Image Similarity Search")
     print("=" * 50)
     
     # Step 1: Create directories

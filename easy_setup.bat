@@ -1,6 +1,6 @@
 @echo off
 echo ======================================================================
-echo 🚀 Grounded SAM Region Search - Easy Setup (Windows)
+echo 🚀 Revers-o: GroundedSAM + Perception Encoders Image Similarity Search - Easy Setup (Windows)
 echo ======================================================================
 echo.
 
@@ -54,8 +54,8 @@ echo [SETUP] Upgrading pip...
 python -m pip install --upgrade pip
 
 :: Install base requirements
-echo [SETUP] Installing base dependencies...
-pip install numpy matplotlib Pillow requests tqdm gradio qdrant-client opencv-python
+echo [SETUP] Installing dependencies from requirements.txt...
+pip install -r requirements.txt
 
 :: Platform-specific installations
 if "%PLATFORM%"=="nvidia" (
@@ -66,14 +66,15 @@ if "%PLATFORM%"=="nvidia" (
     pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cpu
 )
 
-:: Install Grounded SAM and other dependencies
-echo [SETUP] Installing Grounded SAM and other ML dependencies...
-pip install autodistill autodistill-grounded-sam
+# Install Grounded SAM and other dependencies
+# These are now in requirements.txt
+# echo [SETUP] Installing Grounded SAM and other ML dependencies...
+# pip install autodistill autodistill-grounded-sam
 
 :: Clone perception_models if not already present
 if not exist perception_models (
     echo [SETUP] Cloning Facebook Perception Models repository...
-    git clone https://github.com/facebookresearch/perception.git perception_models
+    git clone https://github.com/facebookresearch/perception_models.git perception_models
 )
 
 :: Create run script
@@ -83,7 +84,7 @@ echo @echo off
 echo echo [STARTUP] Activating environment...
 echo call .venv\Scripts\activate.bat
 echo.
-echo echo [STARTUP] Starting Grounded SAM Region Search...
+echo echo [STARTUP] Starting Revers-o: GroundedSAM + Perception Encoders Image Similarity Search...
 echo.
 echo python main.py
 echo.
@@ -106,6 +107,6 @@ echo 1. Add your images to the 'my_images' folder
 echo 2. Run 'run.bat' to start the application
 echo.
 echo The application will open in your browser automatically.
-echo Enjoy using Grounded SAM Region Search!
+echo Enjoy using Revers-o: GroundedSAM + Perception Encoders Image Similarity Search!
 
 pause 

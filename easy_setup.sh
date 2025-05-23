@@ -1,8 +1,8 @@
 #!/bin/bash
-# easy_setup.sh - Simple setup script for Grounded SAM Region Search
+# easy_setup.sh - Simple setup script for Revers-o: GroundedSAM + Perception Encoders Image Similarity Search
 
 echo "======================================================================"
-echo "🚀 Grounded SAM Region Search - Easy Setup"
+echo "🚀 Revers-o: GroundedSAM + Perception Encoders Image Similarity Search - Easy Setup"
 echo "======================================================================"
 
 # Define colors for output
@@ -123,8 +123,8 @@ uv pip install -r requirements.txt
 
 # Platform-specific installations
 if [ "$PLATFORM" == "apple" ]; then
-    print_progress "Installing Apple Silicon specific packages..."
-    uv pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cpu
+    print_progress "Installing Apple Silicon specific packages with MPS support..."
+    uv pip install torch torchvision torchaudio
     
     # Set environment variables for MPS
     export PYTORCH_ENABLE_MPS_FALLBACK=1
@@ -154,28 +154,26 @@ else
     print_success "Perception models repository cloned successfully"
 fi
 
-# Install dependencies from perception_models/requirements.txt
+# Install dependencies from perception_models repository
 print_progress "Installing dependencies from perception_models repository..."
 if [ -f "perception_models/requirements.txt" ]; then
-    # Install specific dependencies that we need from perception_models requirements
-    uv pip install einops ftfy iopath torchdata torchcodec pyahocorasick webdataset fsspec datatrove
-    print_success "Installed dependencies for perception_models"
+    print_success "Dependencies for perception_models will be installed via main requirements.txt"
 else
     print_warning "perception_models requirements.txt not found, skipping extra dependencies"
 fi
 
-# Fix the import path in main.py
-print_progress "Updating import paths in main.py..."
-sed -i.bak 's|sys.path.append(os.path.join(os.path.dirname(__file__), '\''perception_models'\''))|sys.path.append('\''./perception_models'\'')|g' main.py
-sed -i.bak 's|import perception.models.vision_encoder.pe as pe|import core.vision_encoder.pe as pe|g' main.py
-sed -i.bak 's|import perception.models.vision_encoder.transforms as transforms|import core.vision_encoder.transforms as transforms|g' main.py
-rm -f main.py.bak
+# The import paths in main.py are now assumed to be correct for the ./perception_models structure.
+# Removing sed commands that modify them, as they might be fragile.
+# sed -i.bak 's|sys.path.append(os.path.join(os.path.dirname(__file__), '\''perception_models'\''))|sys.path.append('\''./perception_models'\'')|g' main.py
+# sed -i.bak 's|import perception.models.vision_encoder.pe as pe|import core.vision_encoder.pe as pe|g' main.py
+# sed -i.bak 's|import perception.models.vision_encoder.transforms as transforms|import core.vision_encoder.transforms as transforms|g' main.py
+# rm -f main.py.bak
 
 # Create a simple run script
 print_progress "Creating run script..."
 cat > run.sh << 'EOF'
 #!/bin/bash
-# Simple run script for Grounded SAM Region Search
+# Simple run script for Revers-o: GroundedSAM + Perception Encoders Image Similarity Search
 
 # Colors for output
 GREEN='\033[0;32m'
@@ -186,7 +184,7 @@ NC='\033[0m' # No Color
 echo -e "${BLUE}[STARTUP]${NC} Activating environment..."
 source .venv/bin/activate
 
-echo -e "${BLUE}[STARTUP]${NC} Starting Grounded SAM Region Search..."
+echo -e "${BLUE}[STARTUP]${NC} Starting Revers-o: GroundedSAM + Perception Encoders Image Similarity Search..."
 
 # Set environment variables
 if [[ "$(uname -m)" == "arm64" && "$OSTYPE" == "darwin"* ]]; then
@@ -215,4 +213,4 @@ echo "1. Add your images to the 'my_images' folder"
 echo "2. Run './run.sh' to start the application"
 echo ""
 echo "The application will open in your browser automatically."
-echo "Enjoy using Grounded SAM Region Search!" 
+echo "Enjoy using Revers-o!" 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Simple run script for Grounded SAM Region Search
+# Simple run script for Revers-o: GroundedSAM + Perception Encoders Image Similarity Search
 
 # Colors for output
 GREEN='\033[0;32m'
@@ -10,7 +10,7 @@ NC='\033[0m' # No Color
 echo -e "${BLUE}[STARTUP]${NC} Activating environment..."
 source .venv/bin/activate
 
-echo -e "${BLUE}[STARTUP]${NC} Starting Grounded SAM Region Search..."
+echo -e "${BLUE}[STARTUP]${NC} Starting Revers-o..."
 
 # Set environment variables
 if [[ "$(uname -m)" == "arm64" && "$OSTYPE" == "darwin"* ]]; then

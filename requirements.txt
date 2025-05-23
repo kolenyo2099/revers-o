@@ -1,23 +1,38 @@
 # Core dependencies
-numpy==1.26.0
-fsspec==2025.3.2
-opencv-python
-matplotlib
-qdrant-client
-gradio
-torch
-torchvision
-Pillow
-requests
-tqdm
-scikit-learn
+numpy>=1.24.0,<2.0.0
+fsspec>=2023.1.0
+opencv-python>=4.7.0
+matplotlib>=3.6.0
+qdrant-client>=1.7.0
+gradio>=4.0.0
+torch>=2.0.0
+torchvision>=0.15.0
+Pillow>=9.0.0
+requests>=2.28.0
+tqdm>=4.64.0
+scikit-learn>=1.2.0
 
 # Computer vision and ML dependencies
-autodistill-grounded-sam
-roboflow
-supervision
+autodistill-grounded-sam>=0.1.0
+roboflow>=1.0.0
+supervision>=0.16.0
 
 # Perception models dependency (Apple Silicon compatible)
 eva-decord==0.6.1
+
+# Additional dependencies for stability
+transformers>=4.30.0
+huggingface-hub>=0.16.0
+
+# Dependencies from perception_models repository for consistent installation
+einops
+ftfy
+iopath
+torchdata
+torchcodec
+pyahocorasick
+webdataset
+# fsspec is already listed above
+datatrove
 
 
