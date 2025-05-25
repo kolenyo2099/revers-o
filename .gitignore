@@ -41,11 +41,5 @@ qdrant_data/
 .DS_Store
 .lock
 
-# Local development files
-GroundedSAM_Implementation_Fix_Plan.md
-big_logo2.png
-my_images2/
-architecture_guide.md
-
 # Videos directory
 videos/ 
