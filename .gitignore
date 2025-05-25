@@ -39,4 +39,9 @@ qdrant_data/
 
 # System files
 .DS_Store
-.lock 
+.lock
+
+# Local development files
+GroundedSAM_Implementation_Fix_Plan.md
+big_logo2.png
+my_images2/ 

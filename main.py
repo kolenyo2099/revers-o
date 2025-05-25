@@ -435,7 +435,7 @@ def extract_region_embeddings_autodistill(
         print(f"[STATUS] Saved temporary image for GroundedSAM: {temp_image_path}")
 
 
-        prompts = [p.strip() for p in text_prompt.split(',') if p.strip()]
+        prompts = [p.strip() for p in text_prompt.split('.') if p.strip()]
         if not prompts:
             prompts = ["object", "region"] # Default prompts if none provided
             print(f"[WARN] No text prompt provided. Using default prompts: {prompts}")
@@ -443,26 +443,38 @@ def extract_region_embeddings_autodistill(
         print(f"[DEBUG_PROMPT] Initial text_prompt string: '{text_prompt}'")
         print(f"[DEBUG_PROMPT] Derived prompts list: {prompts}")
 
+        # Improved prompt formatting for GroundedSAM
+        # Based on official documentation: period-separated format works best for multiple objects
+        # Natural language descriptions work well for single descriptive phrases
+        if len(prompts) == 1 and len(prompts[0].split()) > 2:
+            # Single descriptive phrase - keep natural language format
+            formatted_prompt = prompts[0]
+            print(f"[DEBUG_PROMPT] Using natural language format: '{formatted_prompt}'")
+        else:
+            # Multiple objects or simple terms - use period-separated format
+            # Since input is already period-separated, just ensure proper formatting
+            formatted_prompt = " . ".join(prompts) + " ."
+            print(f"[DEBUG_PROMPT] Using period-separated format: '{formatted_prompt}'")
+
         ontology_dict = {prompt: prompt for prompt in prompts}
         print(f"[DEBUG_PROMPT] Created ontology_dict: {ontology_dict}")
         
         from autodistill_grounded_sam import GroundedSAM # Ensure this import is here
-        from autodistill.detection import CaptionOntology # Ensure this import is here
+        from autodistill.detection import CaptionOntology
         
         ontology = CaptionOntology(ontology_dict)
-        # Using fixed thresholds as per original successful steps, can be parameterized later
-        BOX_THRESHOLD = 0.35 
-        TEXT_THRESHOLD = 0.25
+        print(f"[DEBUG_PROMPT] Created ontology with classes: {ontology.classes()}")
+        
         grounded_sam = GroundedSAM(
             ontology=ontology,
-            box_threshold=BOX_THRESHOLD,
-            text_threshold=TEXT_THRESHOLD 
+            box_threshold=0.35,
+            text_threshold=0.25
         )
-        
-        print(f"[STATUS] Initialized GroundedSAM with ontology: {ontology_dict}, box_threshold={BOX_THRESHOLD}, text_threshold={TEXT_THRESHOLD}")
+        print(f"[STATUS] Initialized GroundedSAM with box_threshold=0.35, text_threshold=0.25")
 
+        # Use the formatted prompt for detection
         detections = grounded_sam.predict(temp_image_path)
-        print(f"[STATUS] GroundedSAM detected {len(detections)} potential regions")
+        print(f"[STATUS] GroundedSAM detected {len(detections)} regions using prompt: '{formatted_prompt}'")
         
         # Get the class names list directly from the ontology object used by GroundedSAM
         ontology_class_names = ontology.classes()
@@ -1409,8 +1421,8 @@ def process_folder_with_progress(folder_path, prompts, collection_name):
         # Get global model variables
         global pe_model, pe_vit_model, preprocess, device
         
-        # Split prompts if provided as comma-separated string
-        prompt_list = [p.strip() for p in prompts.split(",")] if prompts else ["person", "building", "car", "text", "object"]
+        # Split prompts if provided as period-separated string
+        prompt_list = [p.strip() for p in prompts.split(".")] if prompts else ["person", "building", "car", "text", "object"]
         print(f"[STATUS] Parsed prompts: {prompt_list}")
         
         # Get file list
@@ -1446,10 +1458,10 @@ def process_folder_with_progress(folder_path, prompts, collection_name):
             print(f"[STATUS] Processing image {i+1}/{total}: {img_file}")
             
             try:
-                # Extract region embeddings
+                # Extract region embeddings - use period-separated format
                 image, masks, embeddings, metadata, labels, error_message = extract_region_embeddings_autodistill(
                     img_path,
-                    ",".join(prompt_list),
+                    " . ".join(prompt_list) + " .",
                     pe_model,
                     pe_vit_model,
                     preprocess,
@@ -1557,16 +1569,16 @@ def process_folder_with_progress_advanced(folder_path, prompts, collection_name,
         
         # Process and validate prompts
         if not prompts or not isinstance(prompts, str) or prompts.strip() == "":
-            prompts = "person, building, car, text, object"
+            prompts = "person . building . car . text . object ."
             print(f"[WARNING] No valid prompts provided, using defaults: {prompts}")
             
-        # Split prompts if provided as comma-separated string
-        prompt_list = [p.strip().lower() for p in prompts.split(",") if p.strip()]
+        # Split prompts if provided as period-separated string
+        prompt_list = [p.strip().lower() for p in prompts.split(".") if p.strip()]
         
         # Ensure we have valid prompts
         if not prompt_list:
             prompt_list = ["person", "building", "car", "text", "object"]
-            
+        
         print(f"[STATUS] Parsed prompts: {prompt_list}")
         
         # Get file list - create a stable sorting to ensure consistent processing order
@@ -1643,7 +1655,7 @@ def process_folder_with_progress_advanced(folder_path, prompts, collection_name,
                 # Extract region embeddings with custom parameters
                 image, masks, embeddings, metadata, labels, error_message = extract_region_embeddings_autodistill(
                     img_path,
-                    ",".join(prompt_list),
+                    " . ".join(prompt_list) + " .",
                     pe_model_param=pe_model,
                     pe_vit_model_param=pe_vit_model,
                     preprocess_param=preprocess,
@@ -2786,9 +2798,10 @@ class GradioInterface:
             with gr.Group(visible=True) as region_mode_group:
                 with gr.Row():
                     text_prompt = gr.Textbox(
-                        placeholder="person, car, building, sign, text, animal, food",
-                        label="Detection Prompts (comma-separated)",
-                        value="person, car, building"
+                        placeholder="Examples: 'person . car . building .' OR 'all the chairs in the room' OR 'a person with pink clothes'",
+                        label="Detection Prompts",
+                        info="💡 Use period-separated for multiple objects (person . car . building .) OR natural language for specific descriptions (all the chairs, a person with red shirt)",
+                        value="person . car . building ."
                     )
                 
                 # Add parameter controls before the process button
@@ -3052,9 +3065,10 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                         # Region-specific options
                         with gr.Group(visible=True) as region_options_group:
                             region_prompts = gr.Textbox(
-                                placeholder="person, car, building, sign, text, animal, food",
-                                label="Detection Prompts (comma-separated)",
-                                value="person, car, building"
+                                placeholder="Examples: 'person . car . building .' OR 'all the chairs in the room' OR 'a person with pink clothes'",
+                                label="Detection Prompts",
+                                info="💡 Use period-separated for multiple objects (person . car . building .) OR natural language for specific descriptions (all the chairs, a person with red shirt)",
+                                value="person . car . building ."
                             )
                             
                             # Add pooling strategy selection
@@ -3280,9 +3294,10 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                 with gr.Group(visible=True) as region_mode_group:
                     with gr.Row():
                         text_prompt = gr.Textbox(
-                            placeholder="person, car, building, sign, text, animal, food",
-                            label="Detection Prompts (comma-separated)",
-                            value="person, car, building"
+                            placeholder="Examples: 'person . car . building .' OR 'all the chairs in the room' OR 'a person with pink clothes'",
+                            label="Detection Prompts",
+                            info="💡 Use period-separated for multiple objects (person . car . building .) OR natural language for specific descriptions (all the chairs, a person with red shirt)",
+                            value="person . car . building ."
                         )
                     
                     # Add parameter controls before the process button
@@ -3684,7 +3699,7 @@ def main():
     parser.add_argument("--interface", action="store_true", help="Launch Gradio interface")
     parser.add_argument("--all", action="store_true", help="Build database and launch interface")
     parser.add_argument("--folder", default="./my_images", help="Folder containing images to process")
-    parser.add_argument("--prompts", default="person, building, car, text, object", help="Text prompts for detection")
+    parser.add_argument("--prompts", default="person . building . car . text . object .", help="Text prompts for detection (period-separated format)")
     parser.add_argument("--collection", default="grounded_image_regions", help="Qdrant collection name")
     # Removed legacy interface options
     # Add mode option

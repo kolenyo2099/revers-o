@@ -196,6 +196,29 @@ The application uses several configurable parameters:
 - **Similarity Threshold**: 0.5 (adjustable in interface)
 - **Checkpoint Interval**: Every 3 images
 
+## Understanding Perception Encoder Layers (Meta AI)
+
+**Meta's Perception Encoder (PE) models are unique:**
+- The most general and powerful visual embeddings are often found in the *intermediate layers* of the network—not at the final output layer.
+- This is supported by Meta's 2025 research (["Perception Encoder: The best visual embeddings are not at the output of the network"](https://arxiv.org/abs/2504.13181)).
+
+### What does this mean for you?
+- The `optimal_layer` parameter lets you choose which layer's features to use for region embeddings.
+- **Deeper layers** (higher numbers) are more abstract and may be less discriminative for fine-grained differences between objects.
+- **Intermediate layers** often provide the best balance for tasks like region similarity search.
+
+### How to find the best layer for your use case:
+1. **Experiment:** Try different `optimal_layer` values (e.g., 10, 20, 30, 40) when building your database and when querying.
+2. **Consistency:** For best results, use the same `optimal_layer` for both database creation and querying.
+3. **Evaluate:** Look for a layer where similar objects have high similarity scores, and dissimilar objects have low scores.
+
+### Why is this necessary?
+- The PE model is trained for general vision-language alignment. The "best" features for your task may not be at the end of the network.
+- This flexibility is a feature, not a bug—Meta's research shows it enables state-of-the-art results across many tasks.
+
+**Reference:**
+- [Perception Encoder: The best visual embeddings are not at the output of the network (Meta AI, 2025)](https://arxiv.org/abs/2504.13181)
+
 ## Advanced Usage
 
 ### Custom Processing Parameters:
