@@ -17,6 +17,11 @@ autodistill-grounded-sam>=0.1.0
 roboflow>=1.0.0
 supervision>=0.16.0
 
+# Video processing dependencies
+scenedetect>=0.6.2
+imageio>=2.25.0
+imageio-ffmpeg>=0.4.8
+
 # Perception models dependency (Apple Silicon compatible)
 eva-decord==0.6.1
 

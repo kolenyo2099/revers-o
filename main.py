@@ -39,6 +39,16 @@ from autodistill.detection import CaptionOntology
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
+# Video processing imports
+try:
+    from scenedetect import VideoManager, SceneManager
+    from scenedetect.detectors import ContentDetector
+    import imageio
+    VIDEO_PROCESSING_AVAILABLE = True
+except ImportError as e:
+    print(f"[WARNING] Video processing libraries not available: {e}")
+    VIDEO_PROCESSING_AVAILABLE = False
+
 # Add perception_models to path
 sys.path.append('./perception_models')
 import core.vision_encoder.pe as pe
@@ -207,6 +217,229 @@ def load_pe_model(device):
     pe_model = pe_model.to(device)
     preprocess = transforms.get_image_transform(pe_model.image_size)
     return pe_model, None, preprocess
+
+# =============================================================================
+# VIDEO PROCESSING FUNCTIONS
+# =============================================================================
+
+def extract_keyframes_from_video(video_path, output_folder, max_frames=30, scene_threshold=30.0):
+    """
+    Extract keyframes from a video using scene detection and uniform sampling.
+    
+    Args:
+        video_path: Path to the input video file
+        output_folder: Folder to save extracted frames
+        max_frames: Maximum number of frames to extract
+        scene_threshold: Threshold for scene detection (lower = more sensitive)
+    
+    Returns:
+        tuple: (success, message, extracted_frames_list)
+    """
+    if not VIDEO_PROCESSING_AVAILABLE:
+        return False, "Video processing libraries not available. Please install scenedetect and imageio.", []
+    
+    try:
+        # Create output folder if it doesn't exist
+        os.makedirs(output_folder, exist_ok=True)
+        
+        # Initialize video manager and scene manager
+        video_manager = VideoManager([video_path])
+        scene_manager = SceneManager()
+        scene_manager.add_detector(ContentDetector(threshold=scene_threshold))
+        
+        # Detect scenes
+        video_manager.set_duration()
+        video_manager.start()
+        scene_manager.detect_scenes(frame_source=video_manager)
+        scene_list = scene_manager.get_scene_list()
+        video_manager.release()
+        
+        print(f"[VIDEO] Detected {len(scene_list)} scenes in {video_path}")
+        
+        # If no scenes detected, use uniform sampling
+        if not scene_list:
+            return extract_uniform_frames(video_path, output_folder, max_frames)
+        
+        # Extract keyframes from scenes
+        extracted_frames = []
+        frames_per_scene = max(1, max_frames // len(scene_list))
+        
+        # Use OpenCV for frame extraction
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        
+        frame_count = 0
+        for i, scene in enumerate(scene_list):
+            if frame_count >= max_frames:
+                break
+                
+            start_time = scene[0].get_seconds()
+            end_time = scene[1].get_seconds()
+            
+            # Extract frames uniformly from this scene
+            scene_duration = end_time - start_time
+            if scene_duration > 0:
+                for j in range(frames_per_scene):
+                    if frame_count >= max_frames:
+                        break
+                        
+                    # Calculate frame position within scene
+                    time_offset = (j + 0.5) * scene_duration / frames_per_scene
+                    frame_time = start_time + time_offset
+                    frame_number = int(frame_time * fps)
+                    
+                    # Extract frame
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+                    ret, frame = cap.read()
+                    
+                    if ret:
+                        # Convert BGR to RGB
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        
+                        # Save frame
+                        video_name = os.path.splitext(os.path.basename(video_path))[0]
+                        frame_filename = f"{video_name}_scene{i:03d}_frame{j:03d}.jpg"
+                        frame_path = os.path.join(output_folder, frame_filename)
+                        
+                        # Convert to PIL and save
+                        pil_image = Image.fromarray(frame_rgb)
+                        pil_image.save(frame_path, 'JPEG', quality=95)
+                        
+                        extracted_frames.append(frame_path)
+                        frame_count += 1
+                        
+                        print(f"[VIDEO] Extracted frame {frame_count}/{max_frames}: {frame_filename}")
+        
+        cap.release()
+        
+        return True, f"Successfully extracted {len(extracted_frames)} keyframes from {len(scene_list)} scenes", extracted_frames
+        
+    except Exception as e:
+        print(f"[ERROR] Video processing failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False, f"Error processing video: {str(e)}", []
+
+def extract_uniform_frames(video_path, output_folder, max_frames=30):
+    """
+    Extract frames uniformly distributed across the video duration.
+    
+    Args:
+        video_path: Path to the input video file
+        output_folder: Folder to save extracted frames
+        max_frames: Maximum number of frames to extract
+    
+    Returns:
+        tuple: (success, message, extracted_frames_list)
+    """
+    try:
+        os.makedirs(output_folder, exist_ok=True)
+        
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        duration = total_frames / fps
+        
+        print(f"[VIDEO] Video has {total_frames} frames, {duration:.2f} seconds duration")
+        
+        extracted_frames = []
+        frame_interval = max(1, total_frames // max_frames)
+        
+        for i in range(0, total_frames, frame_interval):
+            if len(extracted_frames) >= max_frames:
+                break
+                
+            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+            ret, frame = cap.read()
+            
+            if ret:
+                # Convert BGR to RGB
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Save frame
+                video_name = os.path.splitext(os.path.basename(video_path))[0]
+                frame_filename = f"{video_name}_uniform_{len(extracted_frames):03d}.jpg"
+                frame_path = os.path.join(output_folder, frame_filename)
+                
+                # Convert to PIL and save
+                pil_image = Image.fromarray(frame_rgb)
+                pil_image.save(frame_path, 'JPEG', quality=95)
+                
+                extracted_frames.append(frame_path)
+                print(f"[VIDEO] Extracted uniform frame {len(extracted_frames)}/{max_frames}: {frame_filename}")
+        
+        cap.release()
+        
+        return True, f"Successfully extracted {len(extracted_frames)} frames uniformly", extracted_frames
+        
+    except Exception as e:
+        print(f"[ERROR] Uniform frame extraction failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False, f"Error extracting uniform frames: {str(e)}", []
+
+def process_video_folder(input_folder, output_folder, max_frames_per_video=30, scene_threshold=30.0):
+    """
+    Process all videos in a folder to extract keyframes.
+    
+    Args:
+        input_folder: Folder containing video files
+        output_folder: Folder to save extracted frames
+        max_frames_per_video: Maximum frames to extract per video
+        scene_threshold: Scene detection threshold
+    
+    Returns:
+        Generator yielding progress updates
+    """
+    if not VIDEO_PROCESSING_AVAILABLE:
+        yield "❌ Video processing libraries not available"
+        return
+    
+    # Supported video extensions
+    video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v'}
+    
+    # Find all video files
+    video_files = []
+    for root, dirs, files in os.walk(input_folder):
+        for file in files:
+            if os.path.splitext(file.lower())[1] in video_extensions:
+                video_files.append(os.path.join(root, file))
+    
+    if not video_files:
+        yield "❌ No video files found in the specified folder"
+        return
+    
+    yield f"📹 Found {len(video_files)} video files to process"
+    
+    total_extracted = 0
+    successful_videos = 0
+    
+    for i, video_path in enumerate(video_files):
+        video_name = os.path.basename(video_path)
+        yield f"🎬 Processing video {i+1}/{len(video_files)}: {video_name}"
+        
+        # Create subfolder for this video's frames
+        video_output_folder = os.path.join(output_folder, os.path.splitext(video_name)[0])
+        
+        try:
+            success, message, extracted_frames = extract_keyframes_from_video(
+                video_path, video_output_folder, max_frames_per_video, scene_threshold
+            )
+            
+            if success:
+                total_extracted += len(extracted_frames)
+                successful_videos += 1
+                yield f"✅ {video_name}: {message}"
+            else:
+                yield f"❌ {video_name}: {message}"
+                
+        except Exception as e:
+            yield f"❌ {video_name}: Error - {str(e)}"
+    
+    yield f"🎉 Processing complete! Successfully processed {successful_videos}/{len(video_files)} videos"
+    yield f"📊 Total frames extracted: {total_extracted}"
+    yield f"💾 Frames saved to: {output_folder}"
 
 # =============================================================================
 # IMAGE PROCESSING FUNCTIONS
@@ -3045,7 +3278,137 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
         
         # Create mode tabs
         with gr.Tabs() as tabs:
-            # Tab 1: Create Database
+            # Tab 0: Quick Start Instructions
+            with gr.TabItem("Quick Start"):
+                gr.Markdown("## 🚀 Quick Start Guide")
+                gr.Markdown("**New to Revers-o? Follow these simple steps to get started:**")
+                
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("""
+                        ### 1. 🎥 Extract Images from Video (Optional)
+                        If you have videos to analyze:
+                        - Go to the **"Extract Images"** tab
+                        - Enter your video folder path
+                        - Set output folder for extracted frames
+                        - Click "Extract Images from Videos"
+                        
+                        ### 2. 🗃️ Create Database
+                        - Go to the **"Create Database"** tab
+                        - Enter path to your images folder
+                        - Choose detection prompts (e.g., "person . car . building")
+                        - Click "Process Folder & Create Database"
+                        
+                        ### 3. 🔍 Search for Matches
+                        - Go to the **"Search Database"** tab
+                        - Upload an image containing what you want to find
+                        - Describe what to look for in the image
+                        - Click "Detect Regions" then "Search Similar Regions"
+                        """)
+                    
+                    with gr.Column():
+                        gr.Markdown("""
+                        ### 💡 Tips for Best Results
+                        
+                        **Good Detection Prompts:**
+                        - "person wearing uniform"
+                        - "vehicle with license plate"
+                        - "building with red door"
+                        - "crowd of people"
+                        
+                        **Processing Modes:**
+                        - **Region Detection**: Find specific objects/people
+                        - **Whole Image**: Find similar scenes/compositions
+                        
+                        **Parameter Guidelines:**
+                        - **Similarity Threshold**: 0.3-0.7 for most searches
+                        - **Embedding Layer**: 40 is optimal for most cases
+                        - **Max Regions**: 5-10 for detailed analysis
+                        
+                        **⚠️ Start Small:** Test with a few images first to understand how the system works before processing large collections.
+                        """)
+                
+                gr.Markdown("---")
+                gr.Markdown("### 📖 Need More Help?")
+                gr.Markdown("Check the **About** tab for detailed documentation and troubleshooting tips.")
+            
+            # Tab 1: Extract Images from Video
+            with gr.TabItem("Extract Images"):
+                gr.Markdown("## 🎬 Extract Images from Video")
+                gr.Markdown("Process videos to extract keyframes and scenes that can be used to create image databases.")
+                
+                if VIDEO_PROCESSING_AVAILABLE:
+                    with gr.Row():
+                        with gr.Column():
+                            video_input_folder = gr.Textbox(
+                                label="Video Folder Path", 
+                                placeholder="/path/to/videos",
+                                info="Folder containing video files (.mp4, .avi, .mov, .mkv, .wmv, .flv, .webm, .m4v)"
+                            )
+                            video_output_folder = gr.Textbox(
+                                label="Output Folder Path", 
+                                placeholder="/path/to/extracted/images",
+                                info="Folder where extracted images will be saved"
+                            )
+                            
+                            with gr.Row():
+                                with gr.Column():
+                                    max_frames_per_video = gr.Slider(
+                                        minimum=5, maximum=100, value=30, step=5,
+                                        label="Max Frames per Video",
+                                        info="Maximum number of keyframes to extract from each video"
+                                    )
+                                with gr.Column():
+                                    scene_threshold = gr.Slider(
+                                        minimum=10.0, maximum=50.0, value=30.0, step=5.0,
+                                        label="Scene Detection Sensitivity",
+                                        info="Lower values = more sensitive scene detection (more scenes)"
+                                    )
+                            
+                            extract_video_button = gr.Button("🎬 Extract Images from Videos", variant="primary")
+                        
+                        with gr.Column():
+                            video_progress = gr.Textbox(
+                                label="Video Processing Status",
+                                lines=10,
+                                max_lines=15,
+                                info="Real-time progress updates will appear here"
+                            )
+                    
+                    # Video processing function with progress updates
+                    def process_videos_with_progress(input_folder, output_folder, max_frames, scene_thresh):
+                        """Process videos and yield progress updates"""
+                        if not input_folder or not output_folder:
+                            yield "❌ Please specify both input and output folder paths"
+                            return
+                        
+                        if not os.path.exists(input_folder):
+                            yield f"❌ Input folder does not exist: {input_folder}"
+                            return
+                        
+                        try:
+                            # Create output folder if it doesn't exist
+                            os.makedirs(output_folder, exist_ok=True)
+                            yield f"📁 Created output folder: {output_folder}"
+                            
+                            # Process videos
+                            for progress_msg in process_video_folder(input_folder, output_folder, max_frames, scene_thresh):
+                                yield progress_msg
+                                
+                        except Exception as e:
+                            yield f"❌ Error during video processing: {str(e)}"
+                    
+                    # Connect video processing button
+                    extract_video_button.click(
+                        process_videos_with_progress,
+                        inputs=[video_input_folder, video_output_folder, max_frames_per_video, scene_threshold],
+                        outputs=[video_progress]
+                    )
+                else:
+                    gr.Markdown("⚠️ **Video processing not available.** Please install required dependencies:")
+                    gr.Code("pip install scenedetect imageio imageio-ffmpeg", language="bash")
+            
+            # Tab 2: Create Database
             with gr.TabItem("Create Database"):
                 gr.Markdown("## Create a New Database")
                 gr.Markdown("Process images in a folder to create a searchable database.")
@@ -3108,7 +3471,7 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                     
                     with gr.Column():
                         # Display the logo image
-                        gr.Image("big_logo.png", show_label=False, container=False)
+                        # gr.Image("big_logo.png", show_label=False, container=False)
                         
                         db_progress = gr.Textbox(label="Processing Status")
                         db_done_msg = gr.Markdown(visible=False)
@@ -3249,7 +3612,7 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                     outputs=[db_progress, db_done_msg]
                 )
             
-            # Tab 2: Search Database
+            # Tab 3: Search Database
             with gr.TabItem("Search Database"):
                 gr.Markdown("## Search Database")
                 gr.Markdown("Upload an image, detect regions, and search for similar regions in your database.")
@@ -3531,30 +3894,311 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                         outputs=[enlarged_result]
                     )
                 
-                # Tab 3: About
-                with gr.TabItem("About"):
-                    gr.Markdown("""
-                    # Revers-o: GroundedSAM + Perception Encoders Image Similarity Search
-                    
-                    This application combines GroundedSAM for region detection and Perception Encoder (PE) for embedding generation to create a powerful semantic image search system.
-                    
-                    ## Features
-                    
-                    - **Region Detection Mode**: Extract meaningful regions from images using GroundedSAM, then embed them with PE
-                    - **Whole Image Mode**: Process entire images directly with PE for faster processing
-                    - **Cross-Compatible Search**: Search across both region and whole image databases
-                    - **Flexible Database Management**: Create and search multiple databases
-                    
-                    ## How to Use
-                    
-                    1. **Create Database tab**: Process folders of images to build your search database
-                    2. **Search Database tab**: Upload and process images to find similar content in your database
-                    
-                    ## Technical Details
-                    
-                    - Built with GroundedSAM, Perception Encoder, and Qdrant vector database
-                    - Supports various semantic layer depths for different types of features
-                    - Cross-compatible between region detection and whole-image processing modes
+            # Tab 4: About
+            with gr.TabItem("About"):
+                gr.Markdown("""
+                    # Revers-o: A  Guide
+
+                    ## Table of Contents
+                    1. [What is Revers-o?](#what-is-revers-o)
+                    2. [Understanding the Technology](#understanding-the-technology)
+                    3. [Getting Started](#getting-started)
+                    4. [Video Processing Workflow](#video-processing-workflow)
+                    5. [Creating Image Databases](#creating-image-databases)
+                    6. [Searching for Similar Content](#searching-for-similar-content)
+                    7. [Parameter Guide](#parameter-guide)
+                    8. [Tips and Best Practices](#tips-and-best-practices)
+                    10. [Troubleshooting](#troubleshooting)
+
+                    ---
+
+                    ## What is Revers-o?
+
+                    Revers-o is a powerful visual investigation tool that helps journalists analyze large collections of images and videos to find similar content, objects, or scenes. Think of it as a "reverse image search" on steroids, specifically designed for investigative work.
+
+                    **Key Capabilities:**
+                    - Extract frames from videos automatically
+                    - Find similar objects, people, or scenes across thousands of images
+                    - Search by describing what you're looking for in plain English
+                    - Build searchable databases of visual evidence
+                    - Identify patterns and connections in visual content
+
+                    ---
+
+                    ## Understanding the Technology
+
+                    ### Why Combine GroundedSAM and Perception Encoders?
+
+                    Revers-o combines two complementary AI systems to provide comprehensive visual analysis capabilities that neither could achieve alone:
+
+                    - **GroundedSAM** excels at precise object detection and segmentation based on natural language descriptions, but operates primarily on explicit, describable objects
+                    - **Perception Encoders** capture rich semantic relationships and abstract visual concepts, but lacks the ability to follow complex user prompts.
+
+                    By combining them, Revers-o allows you to describe what objects you want your database to be made of  AND create high quality embeddings
+
+                    ### GroundedSAM: The Object Detective
+
+                    GroundedSAM combines two powerful AI systems:
+
+                    1. **Grounding DINO**: Understands natural language descriptions and finds objects in images
+                    2. **Segment Anything Model (SAM)**: Precisely outlines the boundaries of detected objects
+
+                    **How it works for journalists:**
+                    - You type: "person wearing red jacket"
+                    - The system finds all people wearing red jackets in your images
+                    - It creates precise outlines around each person
+                    - These outlines become searchable "fingerprints"
+
+                    ### Perception Encoders: The Pattern Recognizer
+
+                    Meta's Perception Encoders are AI systems that understand the visual "meaning" of image regions. They convert visual information into mathematical representations that capture:
+                    - Object appearance and context
+                    - Spatial relationships
+                    - Visual similarities that humans would recognize
+
+                    **Real-world example:**
+                    If you have footage of a protest and want to find all images showing the same building in the background, Perception Encoders may be able to identify that building across different angles, lighting conditions, and camera positions.
+
+                    ### The Hierarchical Nature of Visual Understanding
+
+                    Recent research by Meta has revealed a crucial insight: different layers of Perception Encoders capture different aspects of visual understanding:
+
+                    **Early Layers (Low-level features):**
+                    - Edges, textures, and basic shapes
+                    - Color patterns and gradients
+                    - Simple geometric structures
+
+                    **Middle Layers (Mid-level features):**
+                    - Object parts and components
+                    - Spatial arrangements
+                    - Local patterns and motifs
+
+                    **Later Layers (High-level features):**
+                    - Complete objects and scenes
+                    - Abstract concepts and relationships
+                    - Semantic understanding
+
+                    **How Revers-o Leverages This Hierarchy:**
+
+                    This multi-layered understanding theoretically enables Revers-o to search for both concrete and abstract visual concepts:
+
+                    **Concrete Searches:**
+                    - "Person wearing red jacket" (specific object detection)
+                    - "Blue car with license plate" (detailed object features)
+                    - "Building with glass facade" (architectural elements)
+
+                    **Abstract Concept Searches:**
+                    - Visual similarity based on "mood" or "atmosphere"
+                    - Scenes with similar "energy" or "tension"
+                    - Images that convey similar "emotions" or "contexts"
+                    - Compositional similarities (similar layouts, even with different objects)
+
+
+                    This hierarchical approach means Revers-o can help investigators to explore their visual databases in multiple ways by creating and searching embeddings from different layers.
+
+                    ---
+
+                    ## Getting Started
+
+                    ### 1. Launch the Application
+                    Run the application using the provided scripts:
+                    - **Windows**: Double-click `run.bat`
+                    - **Mac/Linux**: Run `./run.sh` in terminal
+
+                    The interface will open in your web browser.
+
+                    ### 2. Interface Overview
+                    The main interface has three sections:
+                    1. **Extract Images from Video** - Process video files
+                    2. **Create New Database** - Build searchable collections
+                    3. **Search Existing Database** - Find similar content
+
+                    ---
+
+                    ## Video Processing Workflow
+
+                    ### Step-by-Step Process
+
+                    1. **Prepare Your Videos**
+                    - Supported formats: MP4, AVI, MOV, MKV, WMV, FLV, WebM, M4V
+                    - Place videos in a dedicated folder
+
+                    2. **Set Input and Output Folders**
+                    - **Video Folder Path**: Where your videos are stored
+                    - **Output Folder Path**: Where extracted frames will be saved
+
+                    3. **Configure Extraction Settings**
+                    - **Max Frames per Video**: How many frames to extract (default: 30)
+                    - **Scene Detection Threshold**: Sensitivity for detecting scene changes (default: 30.0)
+
+                    4. **Process Videos**
+                    - Click "Process Videos"
+                    - The system will extract keyframes and save them as images
+                    - Progress will be shown in real-time
+
+                    ### Understanding Scene Detection
+                    - **Lower threshold (10-20)**: More sensitive, extracts more frames during subtle changes
+                    - **Higher threshold (40-50)**: Less sensitive, only extracts frames during major scene changes
+                    - **Default (30)**: Balanced approach suitable for most content
+
+                    ---
+
+                    ## Creating Image Databases
+
+                    ### Planning Your Database
+
+                    **Before you start:**
+                    - Organize images by investigation topic
+                    - Use descriptive database names (e.g., "protest_march_2024", "building_surveillance")
+                    - Consider what objects/people you'll be searching for
+
+                    ### Step-by-Step Database Creation
+
+                    1. **Choose Your Images**
+                    - Select the folder containing your images
+                    - Can include extracted video frames
+
+                    2. **Define Search Prompts**
+                    - Enter descriptions of what you may want to reverse-image search in your database. For example, if your main use case is geolocation, you could ask reverso to create a database of buildings (or mountains) so you can later compare new images of buildings with what you already have.
+                    - Use clear, specific language
+                    - Examples: "person in uniform", "red car", "protest sign", "building entrance"
+
+                    3. **Configure Detection Settings**
+                    - **Box Threshold**: How confident the system should be (0.1-0.9)
+                    - **Text Threshold**: Confidence for text-based detection (0.1-0.9)
+
+                    4. **Name Your Database**
+                    - Use descriptive names
+                    - Avoid spaces (use underscores: "investigation_name")
+
+                    5. **Start Processing**
+                    - Click "Create Database"
+                    - Processing time depends on image count and complexity
+
+                    ### Understanding Prompts
+
+                    **Good prompts:**
+                    - "person wearing police uniform"
+                    - "vehicle with license plate"
+                    - "building with red door"
+                    - "crowd of people"
+
+                    **Avoid vague prompts:**
+                    - "thing" or "object"
+                    - "something suspicious"
+                    - "important item"
+
+                    ---
+
+                    ## Searching for Similar Content
+
+                    ### Upload and Detect
+                    1. **Upload Query Image**: The image containing what you want to find
+                    2. **Enter Detection Prompt**: Describe what to select in the uploaded image, these are the things that you later will be able to search within your database.
+                    3. **Adjust Detection Settings**: Fine-tune confidence levels
+                    4. **Click "Detect Regions"**: System identifies matching areas
+
+                    ### Search Parameters
+                    - **Top K Results**: How many similar images to return (default: 10)
+                    - **Similarity Threshold**: Minimum similarity score (0.0-1.0)
+
+                    ### Interpreting Results
+                    - **Similarity Score**: Higher numbers = more similar (0.0-1.0 scale)
+                    - **Bounding Boxes**: Show exactly what was matched
+                    - **File Paths**: Help locate original images
+
+                    ---
+
+                    ## Parameter Guide
+
+                    ### Box Threshold (0.1-0.9)
+                    **What it does:** Controls how confident the system must be to detect an object.
+
+                    - **0.1-0.3**: Very sensitive, finds more objects but may include false positives
+                    - **0.4-0.6**: Balanced, good for most investigations
+                    - **0.7-0.9**: Very strict, only finds objects the system is very confident about
+
+                    **Use cases:**
+                    - **Low (0.2)**: When searching for partially obscured objects
+                    - **High (0.8)**: When you need very precise matches
+
+                    ### Text Threshold (0.1-0.9)
+                    **What it does:** Controls confidence for text-based object detection.
+
+                    - **Lower values**: More liberal interpretation of your text prompts
+                    - **Higher values**: Stricter matching to your exact description
+
+                    ### Scene Detection Threshold (10.0-50.0)
+                    **What it does:** Determines when video scenes change enough to extract a new frame.
+
+                    - **10-20**: Extracts frames frequently, good for detailed analysis
+                    - **30-40**: Balanced extraction, suitable for most content
+                    - **40-50**: Only major scene changes, good for long videos with stable scenes
+
+                    ### Max Frames per Video
+                    **What it does:** Limits how many frames are extracted from each video.
+
+                    - **10-20**: Quick overview of video content
+                    - **30-50**: Detailed analysis while managing storage
+                    - **100+**: Comprehensive frame-by-frame analysis
+
+
+                    ---
+
+                    ## Tips and Best Practices
+
+                    ### Database Management
+                    - **Use descriptive names**: Include date, location, or case identifier
+                    - **Organize by topic**: Separate databases for different investigations
+                    - **Regular backups**: Databases are stored locally and should be backed up
+
+                    ### Prompt Writing
+                    - **Be specific**: "red sedan" instead of "car"
+                    - **Include context**: "person wearing medical mask" vs "person"
+                    - **Test variations**: Try different phrasings for better results
+
+                    ### Performance Optimization
+                    - **Batch processing**: Process large collections overnight
+                    - **Storage management**: Monitor disk space for large video collections
+                    - **Quality over quantity**: Higher resolution images give better results
+
+                    ### Investigation Workflow
+                    1. **Plan your search strategy** before processing
+                    2. **Start with small test batches** to refine parameters
+                    3. **Document your methodology** for reproducible results
+                    4. **Cross-reference findings** with other evidence sources
+
+                    ---
+
+                    ## Troubleshooting
+
+                    ### Common Issues
+
+                    **"No objects detected"**
+                    - Lower the box threshold
+                    - Try different prompt wording
+                    - Check image quality and resolution
+
+                    **"Too many false positives"**
+                    - Raise the box threshold
+                    - Use more specific prompts
+                    - Adjust text threshold
+
+                    **"Video processing fails"**
+                    - Check video format compatibility
+                    - Ensure sufficient disk space
+                    - Try smaller video files first
+
+                    **"Slow processing"**
+                    - Reduce max frames per video
+                    - Process smaller batches
+                    - Close other applications to free memory
+
+                    ### Getting Help
+                    - Check the console output for error messages
+                    - Verify all file paths are correct
+                    - Ensure sufficient disk space for processing
+                    - Restart the application if it becomes unresponsive
                     """)
     
     # Set the default active database if available

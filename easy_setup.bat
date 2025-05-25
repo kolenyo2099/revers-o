@@ -106,6 +106,11 @@ echo ----------------
 echo 1. Add your images to the 'my_images' folder
 echo 2. Run 'run.bat' to start the application
 echo.
+echo ✨ New Feature: Video Processing
+echo - Extract keyframes from videos using the 'Extract Images from Video' section
+echo - Supports .mp4, .avi, .mov, .mkv, .wmv, .flv, .webm, .m4v formats
+echo - Uses intelligent scene detection and keyframe extraction
+echo.
 echo The application will open in your browser automatically.
 echo Enjoy using Revers-o: GroundedSAM + Perception Encoders Image Similarity Search!
 

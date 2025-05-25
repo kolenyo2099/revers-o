@@ -27,6 +27,7 @@ Run the troubleshooting script for help:
 
 - **Automated Object Detection**: Uses Grounded SAM to detect objects based on text prompts
 - **Semantic Understanding**: Leverages Perception Encoder for deep semantic region embeddings
+- **Video Processing**: Extract keyframes from videos using intelligent scene detection and uniform sampling
 - **Searchable Database**: Builds a Qdrant vector database for fast similarity search
 - **Interactive Interface**: Gradio-based web interface for easy interaction
 - **Batch Processing**: Process entire folders of images automatically
@@ -54,6 +55,7 @@ Run the troubleshooting script for help:
 
 4. **Using the interface**:
    - **Main Menu**: Choose between "Create New Database" or "Search Existing Database"
+   - **Extract Images from Video**: Process video files to extract keyframes for database creation
    - **Create Database**: Select folder, enter prompts, and start processing
    - **Search Database**: Upload an image, detect regions, and search for similar regions
 
@@ -185,6 +187,17 @@ grounded-sam-region-search/
 - PNG (.png)
 - BMP (.bmp)
 - TIFF (.tiff)
+
+## Supported Video Formats
+
+- MP4 (.mp4)
+- AVI (.avi)
+- MOV (.mov)
+- MKV (.mkv)
+- WMV (.wmv)
+- FLV (.flv)
+- WebM (.webm)
+- M4V (.m4v)
 
 ## Configuration
 
