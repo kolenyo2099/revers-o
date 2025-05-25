@@ -3415,7 +3415,11 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                 
                 with gr.Row():
                     with gr.Column():
-                        db_folder_path = gr.Textbox(label="Image Folder Path", placeholder="/path/to/images")
+                        db_folder_path = gr.Textbox(
+                            label="Image Folder Path(s)", 
+                            placeholder="/path/to/images1, /path/to/images2, /path/to/images3",
+                            info="💡 Enter a single folder path OR multiple folder paths separated by commas"
+                        )
                         db_collection_name = gr.Textbox(label="Database Name", value="my_image_database", 
                                                       placeholder="Name for your database collection")
                         
@@ -3564,35 +3568,68 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                 
                 # Connect build database functions
                 def process_folder_with_mode(folder_path, collection_name, prompts, layer, mode, min_area_ratio=0.01, max_regions=5, pooling_strategy="top_k"):
-                    """Process folder based on selected mode"""
+                    """Process folder(s) based on selected mode - supports single folder or comma-separated multiple folders"""
                     print(f"[STATUS] Starting folder processing with mode: {mode}")
                     print(f"[STATUS] Using pooling strategy: {pooling_strategy}")
-                    # Set up a generator function to handle progress updates
+                    print(f"[STATUS] Input folder path(s): {folder_path}")
                     
-                    if mode == "Region Detection (GroundedSAM + PE)":
-                        # Modify collection name to include mode and layer
-                        collection_name = f"{collection_name}_layer{layer}"
-                        print(f"[STATUS] Using region collection name: {collection_name}")
-                        # Process with region detection
-                        gen = process_folder_with_progress_advanced(
-                            folder_path, 
-                            prompts, 
-                            collection_name,
-                            optimal_layer=layer,
-                            min_area_ratio=min_area_ratio,
-                            max_regions=max_regions,
-                            pooling_strategy=pooling_strategy
-                        )
+                    # Check if multiple folders are provided (contains comma)
+                    is_multiple_folders = ',' in folder_path
+                    
+                    if is_multiple_folders:
+                        print(f"[STATUS] Detected multiple folder paths, using multi-folder processing")
+                        
+                        if mode == "Region Detection (GroundedSAM + PE)":
+                            # Modify collection name to include mode and layer
+                            collection_name = f"{collection_name}_layer{layer}"
+                            print(f"[STATUS] Using region collection name: {collection_name}")
+                            # Process with region detection for multiple folders
+                            gen = process_multiple_folders_with_progress_advanced(
+                                folder_path, 
+                                prompts, 
+                                collection_name,
+                                optimal_layer=layer,
+                                min_area_ratio=min_area_ratio,
+                                max_regions=max_regions,
+                                pooling_strategy=pooling_strategy
+                            )
+                        else:
+                            # Modify collection name to include mode and layer
+                            collection_name = f"{collection_name}_whole_images_layer{layer}"
+                            print(f"[STATUS] Using whole image collection name: {collection_name}")
+                            # Process with whole image for multiple folders
+                            gen = process_multiple_folders_with_progress_whole_images(
+                                folder_path,
+                                collection_name,
+                                optimal_layer=layer
+                            )
                     else:
-                        # Modify collection name to include mode and layer
-                        collection_name = f"{collection_name}_whole_images_layer{layer}"
-                        print(f"[STATUS] Using whole image collection name: {collection_name}")
-                        # Process with whole image
-                        gen = process_folder_with_progress_whole_images(
-                            folder_path,
-                            collection_name,
-                            optimal_layer=layer
-                        )
+                        print(f"[STATUS] Detected single folder path, using single-folder processing")
+                        
+                        if mode == "Region Detection (GroundedSAM + PE)":
+                            # Modify collection name to include mode and layer
+                            collection_name = f"{collection_name}_layer{layer}"
+                            print(f"[STATUS] Using region collection name: {collection_name}")
+                            # Process with region detection for single folder
+                            gen = process_folder_with_progress_advanced(
+                                folder_path, 
+                                prompts, 
+                                collection_name,
+                                optimal_layer=layer,
+                                min_area_ratio=min_area_ratio,
+                                max_regions=max_regions,
+                                pooling_strategy=pooling_strategy
+                            )
+                        else:
+                            # Modify collection name to include mode and layer
+                            collection_name = f"{collection_name}_whole_images_layer{layer}"
+                            print(f"[STATUS] Using whole image collection name: {collection_name}")
+                            # Process with whole image for single folder
+                            gen = process_folder_with_progress_whole_images(
+                                folder_path,
+                                collection_name,
+                                optimal_layer=layer
+                            )
                     
                     # Return first message
                     result = next(gen)
@@ -4055,8 +4092,11 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                     ### Step-by-Step Database Creation
 
                     1. **Choose Your Images**
-                    - Select the folder containing your images
-                    - Can include extracted video frames
+                    - Select a single folder containing your images OR multiple folders separated by commas
+                    - Example single folder: `/path/to/images`
+                    - Example multiple folders: `/path/to/images1, /path/to/images2, /path/to/images3`
+                    - Can include extracted video frames from different sources
+                    - All images from all folders will be processed into the same database
 
                     2. **Define Search Prompts**
                     - Enter descriptions of what you may want to reverse-image search in your database. For example, if your main use case is geolocation, you could ask reverso to create a database of buildings (or mountains) so you can later compare new images of buildings with what you already have.
@@ -4728,6 +4768,534 @@ def verify_repair_database(collection_name, force_rebuild=False):
         import traceback
         traceback.print_exc()
         return False, f"Verification failed: {e}"
+
+def collect_images_from_multiple_folders(folder_paths_string):
+    """
+    Collect all image paths from multiple comma-separated folder paths.
+    Returns a tuple of (all_image_paths, folder_stats, error_messages)
+    """
+    # Parse and validate folder paths
+    folder_paths = [path.strip() for path in folder_paths_string.split(',') if path.strip()]
+    
+    if not folder_paths:
+        return [], {}, ["No folder paths provided"]
+    
+    all_image_paths = []
+    folder_stats = {}
+    error_messages = []
+    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
+    
+    print(f"[STATUS] Processing {len(folder_paths)} folder(s)")
+    
+    for folder_path in folder_paths:
+        folder_path = folder_path.strip()
+        
+        if not os.path.exists(folder_path):
+            error_msg = f"❌ Folder not found: {folder_path}"
+            error_messages.append(error_msg)
+            print(f"[ERROR] {error_msg}")
+            continue
+            
+        if not os.path.isdir(folder_path):
+            error_msg = f"❌ Path is not a directory: {folder_path}"
+            error_messages.append(error_msg)
+            print(f"[ERROR] {error_msg}")
+            continue
+        
+        # Get image files from this folder
+        try:
+            folder_images = []
+            for file in os.listdir(folder_path):
+                if any(file.lower().endswith(ext) for ext in image_extensions):
+                    full_path = os.path.join(folder_path, file)
+                    folder_images.append(full_path)
+            
+            folder_stats[folder_path] = len(folder_images)
+            all_image_paths.extend(folder_images)
+            
+            print(f"[STATUS] Found {len(folder_images)} images in {folder_path}")
+            
+        except Exception as e:
+            error_msg = f"❌ Error reading folder {folder_path}: {str(e)}"
+            error_messages.append(error_msg)
+            print(f"[ERROR] {error_msg}")
+    
+    # Sort all paths for consistent processing order
+    all_image_paths.sort()
+    
+    print(f"[STATUS] Total images collected: {len(all_image_paths)} from {len([f for f in folder_stats if folder_stats[f] > 0])} valid folders")
+    
+    return all_image_paths, folder_stats, error_messages
+
+
+def process_multiple_folders_with_progress_advanced(folder_paths_string, prompts, collection_name, 
+                                                  optimal_layer=40, min_area_ratio=0.01, max_regions=5, 
+                                                  resume_from_checkpoint=True, pooling_strategy="top_k"):
+    """Process multiple folders with progress updates for the UI with advanced parameters"""
+    try:
+        print(f"[STATUS] Starting multiple folder processing: {folder_paths_string}")
+        print(f"[STATUS] Using collection: {collection_name}")
+        print(f"[STATUS] Using prompts: {prompts}")
+        print(f"[STATUS] Advanced parameters: optimal_layer={optimal_layer}, min_area_ratio={min_area_ratio}, " 
+              f"max_regions={max_regions}, resume_from_checkpoint={resume_from_checkpoint}, pooling_strategy={pooling_strategy}")
+        
+        # Collect all image paths from multiple folders
+        all_image_paths, folder_stats, error_messages = collect_images_from_multiple_folders(folder_paths_string)
+        
+        # Report folder validation results
+        if error_messages:
+            error_summary = "\n".join(error_messages)
+            yield f"⚠️ Folder validation warnings:\n{error_summary}\n", gr.update(visible=False)
+        
+        if not all_image_paths:
+            error_msg = "❌ No valid images found in any of the specified folders"
+            print(f"[ERROR] {error_msg}")
+            yield error_msg, gr.update(visible=False)
+            return
+        
+        # Show folder summary
+        folder_summary = "📁 Folder Summary:\n"
+        valid_folders = 0
+        for folder_path, count in folder_stats.items():
+            if count > 0:
+                folder_summary += f"  ✅ {folder_path}: {count} images\n"
+                valid_folders += 1
+            else:
+                folder_summary += f"  ⚠️ {folder_path}: 0 images\n"
+        
+        folder_summary += f"\n📊 Total: {len(all_image_paths)} images from {valid_folders} folders"
+        
+        yield folder_summary, gr.update(visible=False)
+        
+        # Input validation for other parameters
+        if not collection_name or not isinstance(collection_name, str):
+            collection_name = f"image_database_{int(time.time())}"
+            print(f"[WARNING] Invalid collection name provided, using: {collection_name}")
+        
+        # Ensure parameters are in valid ranges
+        optimal_layer = max(1, int(optimal_layer))
+        min_area_ratio = max(0.001, min(float(min_area_ratio), 0.5))
+        max_regions = max(1, min(int(max_regions), 20))
+        
+        # Get global model variables
+        global pe_model, pe_vit_model, preprocess, device
+        
+        # Process and validate prompts
+        if not prompts or not isinstance(prompts, str) or prompts.strip() == "":
+            prompts = "person . building . car . text . object ."
+            print(f"[WARNING] No valid prompts provided, using defaults: {prompts}")
+            
+        # Split prompts if provided as period-separated string
+        prompt_list = [p.strip().lower() for p in prompts.split(".") if p.strip()]
+        
+        # Ensure we have valid prompts
+        if not prompt_list:
+            prompt_list = ["person", "building", "car", "text", "object"]
+        
+        print(f"[STATUS] Parsed prompts: {prompt_list}")
+        
+        total = len(all_image_paths)
+        print(f"[STATUS] Processing {total} images total")
+        
+        # Process images with progress updates
+        client = None
+        processed = 0
+        skipped = 0
+        errors = 0
+        total_regions = 0
+        vector_dimension = None
+        
+        # Force database cleanup before starting to avoid connection issues
+        from threading import Thread
+        cleanup_thread = Thread(target=cleanup_qdrant_connections, args=(True,))
+        cleanup_thread.start()
+        cleanup_thread.join(timeout=10)
+        
+        # Use collection name provided (should already include layer info from caller)
+        collection_with_layer = collection_name
+        
+        # Update Gradio with initial status
+        yield (f"🔍 Starting to process {total} images from {valid_folders} folders\n"
+              f"📊 Parameters:\n"
+              f"  - Semantic Layer: {optimal_layer}\n"
+              f"  - Min Region Size: {min_area_ratio}\n"
+              f"  - Max Regions: {max_regions}\n"
+              f"  - Resume from checkpoint: {resume_from_checkpoint}\n"
+              f"  - Collection name: {collection_with_layer}"), gr.update(visible=False)
+        
+        print(f"[STATUS] Beginning image processing loop")
+        for i, img_path in enumerate(all_image_paths):
+            # Get just the filename for display
+            img_file = os.path.basename(img_path)
+            # Get the parent folder for context
+            parent_folder = os.path.basename(os.path.dirname(img_path))
+            
+            # Yield progress update with percentage
+            progress_pct = ((i+1) / total) * 100
+            yield f"🔄 Processing: {i+1}/{total} images ({progress_pct:.1f}%)\n📄 Current: {img_file} (from {parent_folder})", gr.update(visible=False)
+            
+            print(f"[STATUS] Processing image {i+1}/{total}: {img_path}")
+            
+            # Skip files that are too small or potentially corrupt
+            try:
+                img_size = os.path.getsize(img_path)
+                if img_size < 1000:  # Files smaller than 1KB are likely invalid
+                    print(f"[WARNING] Skipping very small file ({img_size} bytes): {img_path}")
+                    skipped += 1
+                    continue
+            except Exception as e:
+                print(f"[WARNING] Error checking file size: {e}")
+            
+            try:
+                # Add memory management to avoid memory leaks
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                elif torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+                
+                # Extract region embeddings with custom parameters
+                image, masks, embeddings, metadata, labels, error_message = extract_region_embeddings_autodistill(
+                    img_path,
+                    " . ".join(prompt_list) + " .",
+                    pe_model_param=pe_model,
+                    pe_vit_model_param=pe_vit_model,
+                    preprocess_param=preprocess,
+                    device_param=device,
+                    min_area_ratio=min_area_ratio,
+                    max_regions=max_regions,
+                    optimal_layer=optimal_layer,
+                    pooling_strategy=pooling_strategy
+                )
+                
+                # Check if there was an error during processing
+                if error_message is not None:
+                    print(f"[ERROR] Error processing {img_path}: {error_message}")
+                    errors += 1
+                    # Show error in UI progress updates
+                    if (i + 1) % 1 == 0 or i == total - 1:  # Update every image when there are errors
+                        error_stats = (
+                            f"❌ Error processing {img_file}:\n{error_message}\n\n"
+                            f"📊 Progress: {i+1}/{total} images ({(i+1)/total*100:.1f}%)\n"
+                            f"✅ Processed: {processed} images\n"
+                            f"⏭️ Skipped: {skipped} images (no regions found)\n"
+                            f"❌ Errors: {errors} images\n"
+                            f"🔍 Total regions found: {total_regions}"
+                        )
+                        yield error_stats, gr.update(visible=False)
+                    continue
+                
+                if image is not None and len(embeddings) > 0:
+                    print(f"[STATUS] Found {len(embeddings)} regions in {img_file}")
+                    
+                    # Additional validation for database creation
+                    valid_embeddings = []
+                    valid_metadata = []
+                    invalid_count = 0
+                    
+                    for idx, (emb, meta) in enumerate(zip(embeddings, metadata)):
+                        # Skip regions with missing or invalid data
+                        if emb is None or meta is None:
+                            print(f"[WARNING] Region {idx} has None embedding or metadata, skipping")
+                            invalid_count += 1
+                            continue
+                            
+                        # Validate embedding dimensions
+                        if vector_dimension is not None:
+                            # Use the same logic as dimension detection to extract actual feature dimension
+                            if len(emb.shape) == 2 and emb.shape[0] == 1:
+                                # Shape is [1, D], extract D
+                                actual_dimension = emb.shape[1]
+                            elif len(emb.shape) == 1:
+                                # Shape is [D], use D
+                                actual_dimension = emb.shape[0]
+                            else:
+                                # Flatten for safety
+                                actual_dimension = emb.numel()
+                            
+                            if actual_dimension != vector_dimension:
+                                print(f"[WARNING] Region {idx} has inconsistent embedding dimension: expected {vector_dimension}, got {actual_dimension}")
+                                invalid_count += 1
+                                continue
+                        
+                        # Validate the region metadata
+                        if "bbox" not in meta or len(meta["bbox"]) != 4:
+                            print(f"[WARNING] Region {idx} has invalid bbox, skipping")
+                            invalid_count += 1
+                            continue
+                            
+                        # Skip regions with suspiciously high confidence (1.0 exactly)
+                        phrase = meta.get("phrase", "")
+                        if ": 1.00" in phrase:
+                            print(f"[WARNING] Region {idx} has perfect 1.00 confidence, likely false positive: {phrase}")
+                            invalid_count += 1
+                            continue
+                        
+                        # Add timestamp and source info to metadata
+                        meta["processed_timestamp"] = time.time()
+                        meta["source_filename"] = img_file
+                        meta["source_folder"] = os.path.dirname(img_path)
+                        meta["full_path"] = img_path
+                            
+                        # Include only valid embeddings
+                        valid_embeddings.append(emb)
+                        valid_metadata.append(meta)
+                    
+                    # If we filtered out bad regions, update counts
+                    if invalid_count > 0:
+                        print(f"[WARNING] Filtered out {invalid_count} invalid regions from {img_file}")
+                    
+                    if len(valid_embeddings) > 0:
+                        # Initialize database if not done yet
+                        if not client:
+                            # Extract vector dimension from first valid embedding
+                            first_embedding = valid_embeddings[0]
+                            if len(first_embedding.shape) == 2 and first_embedding.shape[0] == 1:
+                                vector_dimension = first_embedding.shape[1]
+                            elif len(first_embedding.shape) == 1:
+                                vector_dimension = first_embedding.shape[0]
+                            else:
+                                vector_dimension = first_embedding.numel()
+                            
+                            print(f"[STATUS] Initializing database with vector dimension: {vector_dimension}")
+                            client = setup_qdrant(collection_with_layer, vector_dimension)
+                            if client is None:
+                                error_msg = "❌ Failed to initialize Qdrant client"
+                                print(f"[ERROR] {error_msg}")
+                                yield error_msg, gr.update(visible=False)
+                                return
+                        
+                        # Store embeddings in database
+                        store_embeddings_in_qdrant(client, collection_with_layer, valid_embeddings, valid_metadata)
+                        total_regions += len(valid_embeddings)
+                        processed += 1
+                    else:
+                        print(f"[WARNING] No valid regions found in {img_file} after filtering")
+                        skipped += 1
+                else:
+                    print(f"[WARNING] No regions found in {img_file}")
+                    skipped += 1
+                
+            except Exception as e:
+                print(f"[ERROR] Exception processing {img_path}: {e}")
+                import traceback
+                traceback.print_exc()
+                errors += 1
+                continue
+            
+            # Periodic progress updates
+            if (i + 1) % 5 == 0 or i == total - 1:
+                progress_stats = (
+                    f"📊 Progress: {i+1}/{total} images ({(i+1)/total*100:.1f}%)\n"
+                    f"✅ Processed: {processed} images\n"
+                    f"⏭️ Skipped: {skipped} images (no regions found)\n"
+                    f"❌ Errors: {errors} images\n"
+                    f"🔍 Total regions found: {total_regions}"
+                )
+                yield progress_stats, gr.update(visible=False)
+        
+        # Final completion message
+        completion_message = (
+            f"✅ Processing Complete!\n\n"
+            f"📊 Final Statistics:\n"
+            f"  - Total images processed: {processed}/{total}\n"
+            f"  - Images skipped (no regions): {skipped}\n"
+            f"  - Images with errors: {errors}\n"
+            f"  - Total regions stored: {total_regions}\n"
+            f"  - Folders processed: {valid_folders}\n"
+            f"  - Database collection: {collection_with_layer}\n"
+            f"  - Embedding layer used: {optimal_layer}"
+        )
+        
+        print(f"[STATUS] {completion_message}")
+        yield completion_message, gr.update(visible=True)
+        
+        # Close database connection
+        if client:
+            client.close()
+            
+    except Exception as e:
+        error_msg = f"❌ Fatal error during processing: {str(e)}"
+        print(f"[ERROR] {error_msg}")
+        import traceback
+        traceback.print_exc()
+        yield error_msg, gr.update(visible=False)
+
+def process_multiple_folders_with_progress_whole_images(folder_paths_string, collection_name, 
+                                                     optimal_layer=40, resume_from_checkpoint=True):
+    """Process multiple folders for whole image embeddings with progress updates"""
+    try:
+        print(f"[STATUS] Starting multiple folder processing for whole images: {folder_paths_string}")
+        print(f"[STATUS] Using collection: {collection_name}")
+        print(f"[STATUS] Parameters: optimal_layer={optimal_layer}, resume_from_checkpoint={resume_from_checkpoint}")
+        
+        # Collect all image paths from multiple folders
+        all_image_paths, folder_stats, error_messages = collect_images_from_multiple_folders(folder_paths_string)
+        
+        # Report folder validation results
+        if error_messages:
+            error_summary = "\n".join(error_messages)
+            yield f"⚠️ Folder validation warnings:\n{error_summary}\n", gr.update(visible=False)
+        
+        if not all_image_paths:
+            error_msg = "❌ No valid images found in any of the specified folders"
+            print(f"[ERROR] {error_msg}")
+            yield error_msg, gr.update(visible=False)
+            return
+        
+        # Show folder summary
+        folder_summary = "📁 Folder Summary:\n"
+        valid_folders = 0
+        for folder_path, count in folder_stats.items():
+            if count > 0:
+                folder_summary += f"  ✅ {folder_path}: {count} images\n"
+                valid_folders += 1
+            else:
+                folder_summary += f"  ⚠️ {folder_path}: 0 images\n"
+        
+        folder_summary += f"\n📊 Total: {len(all_image_paths)} images from {valid_folders} folders"
+        
+        yield folder_summary, gr.update(visible=False)
+        
+        # Input validation
+        if not collection_name or not isinstance(collection_name, str):
+            collection_name = f"whole_image_database_{int(time.time())}"
+            print(f"[WARNING] Invalid collection name provided, using: {collection_name}")
+        
+        # Ensure parameters are in valid ranges
+        optimal_layer = max(1, int(optimal_layer))
+        
+        # Get global model variables
+        global pe_model, pe_vit_model, preprocess, device
+        
+        total = len(all_image_paths)
+        print(f"[STATUS] Processing {total} images total for whole image embeddings")
+        
+        # Process images with progress updates
+        client = None
+        processed = 0
+        failed = 0
+        vector_dimension = None
+        
+        # Force database cleanup before starting
+        from threading import Thread
+        cleanup_thread = Thread(target=cleanup_qdrant_connections, args=(True,))
+        cleanup_thread.start()
+        cleanup_thread.join(timeout=10)
+        
+        # Use collection name provided (should already include layer info from caller)
+        collection_with_layer = collection_name
+        
+        # Update Gradio with initial status
+        yield (f"🔍 Starting to process {total} whole images from {valid_folders} folders\n"
+               f"📊 Parameters:\n"
+               f"  - Semantic Layer: {optimal_layer}\n"
+               f"  - Resume from checkpoint: {resume_from_checkpoint}\n"
+               f"  - Collection name: {collection_with_layer}"), gr.update(visible=False)
+        
+        print(f"[STATUS] Beginning whole image processing loop")
+        for i, img_path in enumerate(all_image_paths):
+            # Get just the filename for display
+            img_file = os.path.basename(img_path)
+            # Get the parent folder for context
+            parent_folder = os.path.basename(os.path.dirname(img_path))
+            
+            # Yield progress update with percentage
+            progress_pct = ((i+1) / total) * 100
+            yield f"🔄 Processing: {i+1}/{total} images ({progress_pct:.1f}%)\n📄 Current: {img_file} (from {parent_folder})", gr.update(visible=False)
+            
+            print(f"[STATUS] Processing whole image {i+1}/{total}: {img_path}")
+            
+            try:
+                # Add memory management
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                elif torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+                
+                # Extract whole image embedding
+                image, embedding, metadata, label = extract_whole_image_embeddings(
+                    img_path,
+                    pe_model_param=pe_model,
+                    pe_vit_model_param=pe_vit_model,
+                    preprocess_param=preprocess,
+                    device_param=device,
+                    optimal_layer=optimal_layer
+                )
+                
+                if image is not None and embedding is not None:
+                    print(f"[STATUS] Successfully extracted whole image embedding for {img_file}")
+                    
+                    # Initialize database if not done yet
+                    if not client:
+                        # Extract vector dimension from first embedding
+                        if len(embedding.shape) == 2 and embedding.shape[0] == 1:
+                            vector_dimension = embedding.shape[1]
+                        elif len(embedding.shape) == 1:
+                            vector_dimension = embedding.shape[0]
+                        else:
+                            vector_dimension = embedding.numel()
+                        
+                        print(f"[STATUS] Initializing whole image database with vector dimension: {vector_dimension}")
+                        client = setup_qdrant(collection_with_layer, vector_dimension)
+                        if client is None:
+                            error_msg = "❌ Failed to initialize Qdrant client for whole images"
+                            print(f"[ERROR] {error_msg}")
+                            yield error_msg, gr.update(visible=False)
+                            return
+                    
+                    # Add source info to metadata
+                    metadata["processed_timestamp"] = time.time()
+                    metadata["source_filename"] = img_file
+                    metadata["source_folder"] = os.path.dirname(img_path)
+                    metadata["full_path"] = img_path
+                    
+                    # Store embedding in database
+                    store_embeddings_in_qdrant(client, collection_with_layer, [embedding], [metadata])
+                    processed += 1
+                else:
+                    print(f"[WARNING] Failed to extract embedding for {img_file}")
+                    failed += 1
+                
+            except Exception as e:
+                print(f"[ERROR] Exception processing {img_path}: {e}")
+                import traceback
+                traceback.print_exc()
+                failed += 1
+                continue
+            
+            # Periodic progress updates
+            if (i + 1) % 5 == 0 or i == total - 1:
+                progress_stats = (
+                    f"📊 Progress: {i+1}/{total} images ({(i+1)/total*100:.1f}%)\n"
+                    f"✅ Processed: {processed} images\n"
+                    f"❌ Failed: {failed} images"
+                )
+                yield progress_stats, gr.update(visible=False)
+        
+        # Final completion message
+        completion_message = (
+            f"✅ Whole Image Processing Complete!\n\n"
+            f"📊 Final Statistics:\n"
+            f"  - Total images processed: {processed}/{total}\n"
+            f"  - Images failed: {failed}\n"
+            f"  - Folders processed: {valid_folders}\n"
+            f"  - Database collection: {collection_with_layer}\n"
+            f"  - Embedding layer used: {optimal_layer}"
+        )
+        
+        print(f"[STATUS] {completion_message}")
+        yield completion_message, gr.update(visible=True)
+        
+        # Close database connection
+        if client:
+            client.close()
+            
+    except Exception as e:
+        error_msg = f"❌ Fatal error during whole image processing: {str(e)}"
+        print(f"[ERROR] {error_msg}")
+        import traceback
+        traceback.print_exc()
+        yield error_msg, gr.update(visible=False)
 
 if __name__ == "__main__":
     main()
