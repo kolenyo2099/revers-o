@@ -27,19 +27,5 @@ env/
 venv/
 ENV/
 
-# Perception Models repository (handle separately)
-perception_models/
-
-# Image data directories
-my_images/
-image_retrieval_project/
-
-# Database files
-qdrant_data/
-
 # System files
-.DS_Store
-.lock
-
-# Videos directory
-videos/ 
+.DS_Store 
