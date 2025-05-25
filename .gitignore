@@ -44,4 +44,7 @@ qdrant_data/
 # Local development files
 GroundedSAM_Implementation_Fix_Plan.md
 big_logo2.png
-my_images2/ 
+my_images2/
+
+# Videos directory
+videos/ 
