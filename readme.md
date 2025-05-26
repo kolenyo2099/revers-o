@@ -28,6 +28,7 @@ Run the troubleshooting script for help:
 - **Automated Object Detection**: Uses Grounded SAM to detect objects based on text prompts
 - **Semantic Understanding**: Leverages Perception Encoder for deep semantic region embeddings
 - **Video Processing**: Extract keyframes from videos using intelligent scene detection and uniform sampling
+- **URL Video Download**: Download videos directly from YouTube, Twitter, Facebook, Instagram, and other platforms
 - **Searchable Database**: Builds a Qdrant vector database for fast similarity search
 - **Interactive Interface**: Gradio-based web interface for easy interaction
 - **Batch Processing**: Process entire folders of images automatically
@@ -55,7 +56,9 @@ Run the troubleshooting script for help:
 
 4. **Using the interface**:
    - **Main Menu**: Choose between "Create New Database" or "Search Existing Database"
-   - **Extract Images from Video**: Process video files to extract keyframes for database creation
+   - **Extract Images from Video**: 
+     - **From Local Files**: Process video files from your computer to extract keyframes
+     - **From URL**: Download and process videos from YouTube, Twitter, Facebook, Instagram, and other platforms
    - **Create Database**: Select folder, enter prompts, and start processing
    - **Search Database**: Upload an image, detect regions, and search for similar regions
 
@@ -86,6 +89,7 @@ If you encounter issues:
 - **Memory**: At least 8GB RAM recommended for processing
 - **Storage**: Depends on your image collection size
 - **GPU/MPS**: Optional but recommended for faster processing
+- **ffmpeg**: Required for URL video downloads (automatically installed by setup scripts)
 
 ## Installation
 
@@ -198,6 +202,34 @@ grounded-sam-region-search/
 - FLV (.flv)
 - WebM (.webm)
 - M4V (.m4v)
+
+## URL Video Download Support
+
+The application can automatically download videos from popular platforms using yt-dlp:
+
+### Supported Platforms:
+- **YouTube** (youtube.com, youtu.be)
+- **Twitter/X** (twitter.com, x.com)
+- **Facebook** (facebook.com, fb.watch)
+- **Instagram** (instagram.com)
+- **TikTok** (tiktok.com)
+- **Reddit** (reddit.com)
+- **Vimeo** (vimeo.com)
+- **And 1000+ other sites supported by yt-dlp**
+
+### How to Use URL Download:
+1. Navigate to the "Extract Images" tab in the interface
+2. Select the "🌐 From URL" tab
+3. Paste the video URL in the input field
+4. Set your processing parameters (max frames, scene threshold)
+5. Click "Download and Process Video"
+6. The video will be downloaded, processed, and keyframes extracted automatically
+
+### URL Requirements:
+- Must be a direct link to a video post/page
+- Video must be publicly accessible
+- Some platforms may have rate limiting or regional restrictions
+- **ffmpeg must be installed** (setup scripts handle this automatically)
 
 ## Configuration
 

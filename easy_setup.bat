@@ -57,6 +57,33 @@ python -m pip install --upgrade pip
 echo [SETUP] Installing dependencies from requirements.txt...
 pip install -r requirements.txt
 
+:: Install yt-dlp for URL video downloads
+echo [SETUP] Installing yt-dlp for URL video downloads...
+pip install "yt-dlp>=2024.1.1"
+if %ERRORLEVEL% EQU 0 (
+    echo [SUCCESS] yt-dlp installed successfully - URL video downloads enabled
+) else (
+    echo [WARNING] Failed to install yt-dlp - URL video downloads may not work
+)
+
+:: Check for ffmpeg (required by yt-dlp for video processing)
+echo [SETUP] Checking for ffmpeg (required for video processing)...
+where ffmpeg >nul 2>&1
+if %ERRORLEVEL% EQU 0 (
+    echo [SUCCESS] ffmpeg is already installed
+) else (
+    echo [WARNING] ffmpeg not found. This is required for URL video downloads.
+    echo [INFO] Please install ffmpeg manually:
+    echo [INFO] 1. Download from: https://ffmpeg.org/download.html#build-windows
+    echo [INFO] 2. Extract to a folder (e.g., C:\ffmpeg\)
+    echo [INFO] 3. Add C:\ffmpeg\bin to your system PATH
+    echo [INFO] 4. Restart this setup script
+    echo [INFO] 
+    echo [INFO] Alternative: Use Chocolatey package manager:
+    echo [INFO] 1. Install Chocolatey: https://chocolatey.org/install
+    echo [INFO] 2. Run: choco install ffmpeg
+)
+
 :: Platform-specific installations
 if "%PLATFORM%"=="nvidia" (
     echo [SETUP] Installing NVIDIA GPU specific packages...
@@ -106,8 +133,9 @@ echo ----------------
 echo 1. Add your images to the 'my_images' folder
 echo 2. Run 'run.bat' to start the application
 echo.
-echo ✨ New Feature: Video Processing
-echo - Extract keyframes from videos using the 'Extract Images from Video' section
+echo ✨ Video Processing Features:
+echo - Extract keyframes from local videos using the 'Extract Images from Video' section
+echo - Download videos from URLs (YouTube, Twitter, Facebook, Instagram, etc.)
 echo - Supports .mp4, .avi, .mov, .mkv, .wmv, .flv, .webm, .m4v formats
 echo - Uses intelligent scene detection and keyframe extraction
 echo.

@@ -14,6 +14,10 @@ import uuid
 import math
 import io
 import tempfile
+import subprocess
+import shutil
+import urllib.parse
+import hashlib
 from contextlib import nullcontext
 from pathlib import Path
 from typing import List, Optional
@@ -48,6 +52,14 @@ try:
 except ImportError as e:
     print(f"[WARNING] Video processing libraries not available: {e}")
     VIDEO_PROCESSING_AVAILABLE = False
+
+# Check for yt-dlp availability
+try:
+    import yt_dlp
+    YT_DLP_AVAILABLE = True
+except ImportError:
+    YT_DLP_AVAILABLE = False
+    print("[WARNING] yt-dlp not available. URL video downloads will not work.")
 
 # Add perception_models to path
 sys.path.append('./perception_models')
@@ -238,9 +250,28 @@ def extract_keyframes_from_video(video_path, output_folder, max_frames=30, scene
     if not VIDEO_PROCESSING_AVAILABLE:
         return False, "Video processing libraries not available. Please install scenedetect and imageio.", []
     
+    # Debug: Check if video file exists
+    print(f"[DEBUG] Checking video file: {video_path}")
+    if not os.path.exists(video_path):
+        print(f"[ERROR] Video file does not exist: {video_path}")
+        return False, f"Video file not found: {video_path}", []
+    
+    if not os.path.isfile(video_path):
+        print(f"[ERROR] Path is not a file: {video_path}")
+        return False, f"Path is not a file: {video_path}", []
+    
+    file_size = os.path.getsize(video_path)
+    print(f"[DEBUG] Video file exists, size: {file_size} bytes")
+    
+    if file_size == 0:
+        print(f"[ERROR] Video file is empty: {video_path}")
+        return False, f"Video file is empty: {video_path}", []
+
     try:
         # Create output folder if it doesn't exist
         os.makedirs(output_folder, exist_ok=True)
+        
+        print(f"[DEBUG] Initializing video manager for: {video_path}")
         
         # Initialize video manager and scene manager
         video_manager = VideoManager([video_path])
@@ -266,8 +297,14 @@ def extract_keyframes_from_video(video_path, output_folder, max_frames=30, scene
         
         # Use OpenCV for frame extraction
         cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f"[ERROR] OpenCV could not open video: {video_path}")
+            return False, f"Could not open video file with OpenCV: {video_path}", []
+            
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = cap.get(cv2.CAP_PROP_FPS)
+        
+        print(f"[DEBUG] Video properties - Total frames: {total_frames}, FPS: {fps}")
         
         frame_count = 0
         for i, scene in enumerate(scene_list):
@@ -440,6 +477,255 @@ def process_video_folder(input_folder, output_folder, max_frames_per_video=30, s
     yield f"🎉 Processing complete! Successfully processed {successful_videos}/{len(video_files)} videos"
     yield f"📊 Total frames extracted: {total_extracted}"
     yield f"💾 Frames saved to: {output_folder}"
+
+# =============================================================================
+# VIDEO URL DOWNLOAD FUNCTIONS
+# =============================================================================
+
+def is_supported_video_url(url):
+    """
+    Check if the URL is from a supported video platform.
+    
+    Args:
+        url: URL string to check
+        
+    Returns:
+        bool: True if URL is from a supported platform
+    """
+    if not url or not isinstance(url, str):
+        return False
+    
+    try:
+        parsed = urllib.parse.urlparse(url.strip())
+        domain = parsed.netloc.lower()
+        
+        # Remove 'www.' prefix if present
+        if domain.startswith('www.'):
+            domain = domain[4:]
+        
+        supported_domains = {
+            'youtube.com', 'youtu.be', 'youtube-nocookie.com',
+            'twitter.com', 'x.com', 'nitter.net',
+            'facebook.com', 'fb.com', 'm.facebook.com',
+            'instagram.com', 'tiktok.com', 'vimeo.com',
+            'dailymotion.com', 'twitch.tv'
+        }
+        
+        return domain in supported_domains
+    except Exception:
+        return False
+
+def download_video_from_url(url, output_dir, max_quality='720p'):
+    """
+    Download a single video from URL using yt-dlp.
+    
+    Args:
+        url: Video URL to download
+        output_dir: Directory to save the downloaded video
+        max_quality: Maximum video quality (e.g., '720p', '1080p', 'best')
+        
+    Returns:
+        tuple: (success, message, downloaded_file_path)
+    """
+    if not YT_DLP_AVAILABLE:
+        return False, "yt-dlp not available. Please install it: pip install yt-dlp", None
+    
+    if not is_supported_video_url(url):
+        return False, f"Unsupported URL or invalid format: {url}", None
+    
+    try:
+        # Ensure output directory exists
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Create a safe filename using timestamp and hash
+        url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+        timestamp = int(time.time())
+        safe_filename = f"video_{timestamp}_{url_hash}.%(ext)s"
+        
+        # Configure yt-dlp options with more predictable filename
+        ydl_opts = {
+            'outtmpl': os.path.join(output_dir, safe_filename),
+            'format': f'best[height<={max_quality[:-1]}]/best',  # Simplified format to avoid merging issues
+            'merge_output_format': 'mp4',
+            'writeinfojson': False,
+            'writethumbnail': False,
+            'quiet': True,
+            'no_warnings': True,
+            'restrictfilenames': True,  # Use only ASCII characters and avoid special characters
+            'windowsfilenames': True,   # Avoid characters that are problematic on Windows
+        }
+        
+        downloaded_files = []
+        
+        # Custom hook to capture downloaded files
+        def progress_hook(d):
+            if d['status'] == 'finished':
+                file_path = d['filename']
+                print(f"[DEBUG] yt-dlp reported downloaded file: {file_path}")
+                # Only add files that exist and are not temporary/intermediate files
+                if os.path.exists(file_path) and not any(temp in os.path.basename(file_path) for temp in ['.f', '.part', '.temp']):
+                    downloaded_files.append(file_path)
+                    print(f"[DEBUG] Final file confirmed and added: {file_path}")
+                else:
+                    print(f"[DEBUG] Skipping intermediate/temp file: {file_path}")
+        
+        ydl_opts['progress_hooks'] = [progress_hook]
+        
+        # Download the video
+        print(f"[DEBUG] Starting download from: {url}")
+        print(f"[DEBUG] Output directory: {output_dir}")
+        print(f"[DEBUG] Filename template: {safe_filename}")
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        
+        # Wait a moment for any final processing
+        time.sleep(2)
+        
+        # Additional verification: check for any video files in the output directory
+        if not downloaded_files:
+            print(f"[DEBUG] No files captured by progress hook, scanning directory...")
+            video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v'}
+            for file in os.listdir(output_dir):
+                file_path = os.path.join(output_dir, file)
+                if (os.path.splitext(file.lower())[1] in video_extensions and 
+                    os.path.isfile(file_path) and
+                    not any(temp in file for temp in ['.f', '.part', '.temp'])):
+                    # Check if this is a recently created file (within last 120 seconds)
+                    if os.path.getmtime(file_path) > time.time() - 120:
+                        downloaded_files.append(file_path)
+                        print(f"[DEBUG] Found recent video file: {file_path}")
+        
+        if downloaded_files:
+            # Sort by modification time and take the most recent
+            downloaded_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+            final_path = downloaded_files[0]
+            file_size = os.path.getsize(final_path)
+            print(f"[DEBUG] Successfully downloaded: {final_path} ({file_size} bytes)")
+            return True, f"Successfully downloaded video ({file_size} bytes)", final_path
+        else:
+            return False, "Download completed but no valid video file was created", None
+            
+    except Exception as e:
+        error_msg = str(e)
+        print(f"[DEBUG] Download exception: {error_msg}")
+        if "Private video" in error_msg:
+            return False, "Video is private or requires authentication", None
+        elif "Video unavailable" in error_msg:
+            return False, "Video is unavailable or has been removed", None
+        elif "Unsupported URL" in error_msg:
+            return False, f"URL not supported by yt-dlp: {url}", None
+        else:
+            return False, f"Download failed: {error_msg}", None
+
+def process_video_urls(urls_text, output_folder, max_frames_per_video=30, scene_threshold=30.0, max_quality='720p'):
+    """
+    Process videos from URLs by downloading them first, then extracting keyframes.
+    
+    Args:
+        urls_text: Text containing URLs (one per line)
+        output_folder: Folder to save extracted frames  
+        max_frames_per_video: Maximum frames to extract per video
+        scene_threshold: Scene detection threshold
+        max_quality: Maximum video quality for downloads
+        
+    Returns:
+        Generator yielding progress updates
+    """
+    if not VIDEO_PROCESSING_AVAILABLE:
+        yield "❌ Video processing libraries not available"
+        return
+        
+    if not YT_DLP_AVAILABLE:
+        yield "❌ yt-dlp not available. Please install it: pip install yt-dlp"
+        return
+    
+    # Parse URLs from input text
+    urls = [url.strip() for url in urls_text.split('\n') if url.strip()]
+    
+    if not urls:
+        yield "❌ No URLs provided"
+        return
+    
+    # Filter out invalid URLs
+    valid_urls = [url for url in urls if is_supported_video_url(url)]
+    invalid_urls = [url for url in urls if not is_supported_video_url(url)]
+    
+    if invalid_urls:
+        yield f"⚠️ Skipping {len(invalid_urls)} invalid/unsupported URLs"
+    
+    if not valid_urls:
+        yield "❌ No valid video URLs found"
+        return
+    
+    yield f"🔗 Found {len(valid_urls)} valid video URLs to process"
+    
+    # Create temporary directory for downloads
+    temp_download_dir = tempfile.mkdtemp(prefix="revers_o_downloads_")
+    
+    try:
+        total_extracted = 0
+        successful_videos = 0
+        downloaded_files = []
+        
+        # Download all videos first
+        yield f"📥 Starting downloads to temporary directory..."
+        
+        for i, url in enumerate(valid_urls):
+            yield f"📥 Downloading video {i+1}/{len(valid_urls)}: {url}"
+            
+            try:
+                success, message, downloaded_file = download_video_from_url(url, temp_download_dir, max_quality)
+                
+                if success and downloaded_file:
+                    downloaded_files.append(downloaded_file)
+                    yield f"✅ Downloaded: {os.path.basename(downloaded_file)}"
+                else:
+                    yield f"❌ Failed to download {url}: {message}"
+                    
+            except Exception as e:
+                yield f"❌ Error downloading {url}: {str(e)}"
+        
+        if not downloaded_files:
+            yield "❌ No videos were successfully downloaded"
+            return
+        
+        yield f"🎬 Successfully downloaded {len(downloaded_files)} videos. Starting frame extraction..."
+        
+        # Now process the downloaded videos
+        for i, video_path in enumerate(downloaded_files):
+            video_name = os.path.basename(video_path)
+            yield f"🎬 Processing video {i+1}/{len(downloaded_files)}: {video_name}"
+            
+            # Create subfolder for this video's frames
+            video_output_folder = os.path.join(output_folder, os.path.splitext(video_name)[0])
+            
+            try:
+                success, message, extracted_frames = extract_keyframes_from_video(
+                    video_path, video_output_folder, max_frames_per_video, scene_threshold
+                )
+                
+                if success:
+                    total_extracted += len(extracted_frames)
+                    successful_videos += 1
+                    yield f"✅ {video_name}: {message}"
+                else:
+                    yield f"❌ {video_name}: {message}"
+                    
+            except Exception as e:
+                yield f"❌ {video_name}: Error - {str(e)}"
+        
+        yield f"🎉 Processing complete! Successfully processed {successful_videos}/{len(downloaded_files)} videos"
+        yield f"📊 Total frames extracted: {total_extracted}"
+        yield f"💾 Frames saved to: {output_folder}"
+        
+    finally:
+        # Cleanup temporary directory
+        try:
+            shutil.rmtree(temp_download_dir)
+            yield f"🧹 Cleaned up temporary downloads"
+        except Exception as e:
+            yield f"⚠️ Warning: Could not clean up temporary directory: {str(e)}"
 
 # =============================================================================
 # IMAGE PROCESSING FUNCTIONS
@@ -1667,7 +1953,8 @@ def process_folder_with_progress(folder_path, prompts, collection_name):
         
         if total == 0:
             print(f"[STATUS] No images found in folder {folder_path}")
-            return "No images found in folder", gr.update(visible=False)
+            yield "No images found in folder", gr.update(visible=False)
+            return
         
         # Process images with progress updates
         client = None
@@ -1763,13 +2050,13 @@ def process_folder_with_progress(folder_path, prompts, collection_name):
             f"📦 Database collection: '{collection_name}'"
         )
         print(f"[STATUS] {final_message}")
-        return final_message, gr.update(visible=True)
+        yield final_message, gr.update(visible=True)
     except Exception as e:
         error_message = f"❌ Error processing folder: {str(e)}"
         print(f"[ERROR] {error_message}")
         import traceback
         traceback.print_exc()
-        return error_message, gr.update(visible=False)
+        yield error_message, gr.update(visible=False)
 
 def process_folder_with_progress_advanced(folder_path, prompts, collection_name, 
                                   optimal_layer=40, min_area_ratio=0.01, max_regions=5, 
@@ -1786,7 +2073,8 @@ def process_folder_with_progress_advanced(folder_path, prompts, collection_name,
         if not folder_path or not os.path.exists(folder_path):
             error_msg = f"❌ Error: Folder '{folder_path}' does not exist or is invalid"
             print(f"[ERROR] {error_msg}")
-            return error_msg, gr.update(visible=False)
+            yield error_msg, gr.update(visible=False)
+            return
             
         if not collection_name or not isinstance(collection_name, str):
             collection_name = f"image_database_{int(time.time())}"
@@ -1823,7 +2111,8 @@ def process_folder_with_progress_advanced(folder_path, prompts, collection_name,
         
         if total == 0:
             print(f"[STATUS] No images found in folder {folder_path}")
-            return "No images found in folder", gr.update(visible=False)
+            yield "No images found in folder", gr.update(visible=False)
+            return
         
         # Process images with progress updates
         client = None
@@ -2145,13 +2434,13 @@ def process_folder_with_progress_advanced(folder_path, prompts, collection_name,
                 f"📦 Database collection: '{collection_with_layer}'"
             )
         print(f"[STATUS] {final_message}")
-        return final_message, gr.update(visible=True)
+        yield final_message, gr.update(visible=True)
     except Exception as e:
         error_message = f"❌ Error processing folder: {str(e)}"
         print(f"[ERROR] {error_message}")
         import traceback
         traceback.print_exc()
-        return error_message, gr.update(visible=False)
+        yield error_message, gr.update(visible=False)
 
 def process_folder_with_progress_whole_images(folder_path, collection_name, 
                                     optimal_layer=40, resume_from_checkpoint=True):
@@ -2173,7 +2462,8 @@ def process_folder_with_progress_whole_images(folder_path, collection_name,
         
         if total == 0:
             print(f"[STATUS] No images found in folder {folder_path}")
-            return "No images found in folder", gr.update(visible=False)
+            yield "No images found in folder", gr.update(visible=False)
+            return
         
         # Process images with progress updates
         client = None
@@ -2247,18 +2537,18 @@ def process_folder_with_progress_whole_images(folder_path, collection_name,
         if processed > 0:
             final_message = f"✅ Processing complete!\n📊 Processed {processed}/{total} images\n🗄️ Collection: {whole_image_collection}\n🧠 Using embedding layer: {optimal_layer}"
             print(f"[STATUS] {final_message}")
-            return final_message, gr.update(visible=True)
+            yield final_message, gr.update(visible=True)
         else:
             error_message = f"❌ Processing failed. No images were successfully processed."
             print(f"[STATUS] {error_message}")
-            return error_message, gr.update(visible=False)
+            yield error_message, gr.update(visible=False)
         
     except Exception as e:
         error_message = f"❌ Error: {str(e)}"
         print(f"[ERROR] Batch processing error: {e}")
         import traceback
         traceback.print_exc()
-        return error_message, gr.update(visible=False)
+        yield error_message, gr.update(visible=False)
 
 # =============================================================================
 # GRADIO INTERFACE CLASSES
@@ -3338,44 +3628,104 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                 gr.Markdown("Process videos to extract keyframes and scenes that can be used to create image databases.")
                 
                 if VIDEO_PROCESSING_AVAILABLE:
-                    with gr.Row():
-                        with gr.Column():
-                            video_input_folder = gr.Textbox(
-                                label="Video Folder Path", 
-                                placeholder="/path/to/videos",
-                                info="Folder containing video files (.mp4, .avi, .mov, .mkv, .wmv, .flv, .webm, .m4v)"
-                            )
-                            video_output_folder = gr.Textbox(
-                                label="Output Folder Path", 
-                                placeholder="/path/to/extracted/images",
-                                info="Folder where extracted images will be saved"
-                            )
-                            
+                    # Add tabs for different input methods
+                    with gr.Tabs():
+                        # Tab for folder-based processing (existing functionality)
+                        with gr.TabItem("📁 From Local Files"):
                             with gr.Row():
                                 with gr.Column():
-                                    max_frames_per_video = gr.Slider(
-                                        minimum=5, maximum=100, value=30, step=5,
-                                        label="Max Frames per Video",
-                                        info="Maximum number of keyframes to extract from each video"
+                                    video_input_folder = gr.Textbox(
+                                        label="Video Folder Path", 
+                                        placeholder="/path/to/videos",
+                                        info="Folder containing video files (.mp4, .avi, .mov, .mkv, .wmv, .flv, .webm, .m4v)"
                                     )
+                                    video_output_folder = gr.Textbox(
+                                        label="Output Folder Path", 
+                                        placeholder="/path/to/extracted/images",
+                                        info="Folder where extracted images will be saved"
+                                    )
+                                    
+                                    with gr.Row():
+                                        with gr.Column():
+                                            max_frames_per_video = gr.Slider(
+                                                minimum=5, maximum=100, value=30, step=5,
+                                                label="Max Frames per Video",
+                                                info="Maximum number of keyframes to extract from each video"
+                                            )
+                                        with gr.Column():
+                                            scene_threshold = gr.Slider(
+                                                minimum=10.0, maximum=50.0, value=30.0, step=5.0,
+                                                label="Scene Detection Sensitivity",
+                                                info="Lower values = more sensitive scene detection (more scenes)"
+                                            )
+                                    
+                                    extract_video_button = gr.Button("🎬 Extract Images from Videos", variant="primary")
+                                
                                 with gr.Column():
-                                    scene_threshold = gr.Slider(
-                                        minimum=10.0, maximum=50.0, value=30.0, step=5.0,
-                                        label="Scene Detection Sensitivity",
-                                        info="Lower values = more sensitive scene detection (more scenes)"
+                                    video_progress = gr.Textbox(
+                                        label="Video Processing Status",
+                                        lines=10,
+                                        max_lines=15,
+                                        info="Real-time progress updates will appear here"
                                     )
-                            
-                            extract_video_button = gr.Button("🎬 Extract Images from Videos", variant="primary")
                         
-                        with gr.Column():
-                            video_progress = gr.Textbox(
-                                label="Video Processing Status",
-                                lines=10,
-                                max_lines=15,
-                                info="Real-time progress updates will appear here"
-                            )
+                        # Tab for URL-based processing (new functionality)
+                        with gr.TabItem("🔗 From URLs"):
+                            if YT_DLP_AVAILABLE:
+                                with gr.Row():
+                                    with gr.Column():
+                                        gr.Markdown("### Supported: youtube, twitter, facebook, instagram, tiktok, vimeo, some others")                                        
+                                        video_urls_input = gr.Textbox(
+                                            label="Video URLs",
+                                            lines=5,
+                                            placeholder="https://www.youtube.com/watch?v=...\nhttps://twitter.com/user/status/...\nhttps://www.tiktok.com/@user/video/...\n\n(Enter one URL per line)",
+                                            info="Enter video URLs, one per line. Supports YouTube, Twitter, Facebook, Instagram, TikTok, Vimeo, and more."
+                                        )
+                                        
+                                        url_output_folder = gr.Textbox(
+                                            label="Output Folder Path",
+                                            placeholder="/path/to/extracted/images",
+                                            info="Folder where extracted images will be saved"
+                                        )
+                                        
+                                        with gr.Row():
+                                            with gr.Column():
+                                                url_max_frames = gr.Slider(
+                                                    minimum=5, maximum=100, value=30, step=5,
+                                                    label="Max Frames per Video",
+                                                    info="Maximum number of keyframes to extract from each video"
+                                                )
+                                            with gr.Column():
+                                                url_scene_threshold = gr.Slider(
+                                                    minimum=10.0, maximum=50.0, value=30.0, step=5.0,
+                                                    label="Scene Detection Sensitivity",
+                                                    info="Lower values = more sensitive scene detection"
+                                                )
+                                        
+                                        with gr.Row():
+                                            with gr.Column():
+                                                video_quality = gr.Dropdown(
+                                                    choices=["480p", "720p", "1080p", "best"],
+                                                    value="720p",
+                                                    label="Video Quality",
+                                                    info="Maximum video quality to download (higher quality = larger files)"
+                                                )
+                                        
+                                        extract_urls_button = gr.Button("🔗 Download & Extract Images from URLs", variant="primary")
+                                    
+                                    with gr.Column():
+                                        url_progress = gr.Textbox(
+                                            label="URL Processing Status",
+                                            lines=10,
+                                            max_lines=15,
+                                            info="Download and processing updates will appear here"
+                                        )
+                            else:
+                                gr.Markdown("⚠️ **URL video downloading not available.**")
+                                gr.Markdown("Please install yt-dlp to enable URL downloads:")
+                                gr.Code("pip install yt-dlp", language="bash")
                     
-                    # Video processing function with progress updates
+                    # Video processing function with progress updates (existing)
                     def process_videos_with_progress(input_folder, output_folder, max_frames, scene_thresh):
                         """Process videos and yield progress updates"""
                         if not input_folder or not output_folder:
@@ -3398,12 +3748,43 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                         except Exception as e:
                             yield f"❌ Error during video processing: {str(e)}"
                     
-                    # Connect video processing button
+                    # URL processing function with progress updates (new)
+                    def process_urls_with_progress(urls_text, output_folder, max_frames, scene_thresh, quality):
+                        """Process URLs and yield progress updates"""
+                        if not urls_text or not urls_text.strip():
+                            yield "❌ Please provide at least one video URL"
+                            return
+                        
+                        if not output_folder:
+                            yield "❌ Please specify an output folder path"
+                            return
+                        
+                        try:
+                            # Create output folder if it doesn't exist
+                            os.makedirs(output_folder, exist_ok=True)
+                            yield f"📁 Created output folder: {output_folder}"
+                            
+                            # Process URLs
+                            for progress_msg in process_video_urls(urls_text, output_folder, max_frames, scene_thresh, quality):
+                                yield progress_msg
+                                
+                        except Exception as e:
+                            yield f"❌ Error during URL processing: {str(e)}"
+                    
+                    # Connect existing video processing button
                     extract_video_button.click(
                         process_videos_with_progress,
                         inputs=[video_input_folder, video_output_folder, max_frames_per_video, scene_threshold],
                         outputs=[video_progress]
                     )
+                    
+                    # Connect new URL processing button (only if yt-dlp is available)
+                    if YT_DLP_AVAILABLE:
+                        extract_urls_button.click(
+                            process_urls_with_progress,
+                            inputs=[video_urls_input, url_output_folder, url_max_frames, url_scene_threshold, video_quality],
+                            outputs=[url_progress]
+                        )
                 else:
                     gr.Markdown("⚠️ **Video processing not available.** Please install required dependencies:")
                     gr.Code("pip install scenedetect imageio imageio-ffmpeg", language="bash")

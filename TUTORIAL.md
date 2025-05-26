@@ -118,7 +118,13 @@ The main interface has three sections:
 
 ## Video Processing Workflow
 
-### Step-by-Step Process
+### Two Ways to Process Videos
+
+Revers-o offers two methods for processing videos into searchable image databases:
+
+#### Method 1: Local Video Files
+
+**Step-by-Step Process**
 
 1. **Prepare Your Videos**
    - Supported formats: MP4, AVI, MOV, MKV, WMV, FLV, WebM, M4V
@@ -136,6 +142,54 @@ The main interface has three sections:
    - Click "Process Videos"
    - The system will extract keyframes and save them as images
    - Progress will be shown in real-time
+
+#### Method 2: URL Video Download
+
+**Supported Platforms:**
+- YouTube (youtube.com, youtu.be)
+- Twitter/X (twitter.com, x.com)
+- Facebook (facebook.com, fb.watch)
+- Instagram (instagram.com)
+- TikTok (tiktok.com)
+- Reddit (reddit.com)
+- Vimeo (vimeo.com)
+- And 1000+ other sites supported by yt-dlp
+
+**Step-by-Step Process**
+
+1. **Navigate to URL Download Tab**
+   - In the "Extract Images from Video" section
+   - Select the "🌐 From URL" tab
+
+2. **Enter Video URL**
+   - Paste the complete URL of the video
+   - Examples:
+     - `https://www.youtube.com/watch?v=VIDEO_ID`
+     - `https://twitter.com/user/status/TWEET_ID`
+     - `https://www.facebook.com/watch/?v=VIDEO_ID`
+
+3. **Set Output Folder**
+   - **Output Folder Path**: Where extracted frames will be saved
+   - System will create subfolders automatically
+
+4. **Configure Extraction Settings**
+   - **Max Frames per Video**: How many frames to extract (default: 30)
+   - **Scene Detection Threshold**: Sensitivity for detecting scene changes (default: 30.0)
+
+5. **Download and Process**
+   - Click "Download and Process Video"
+   - The system will:
+     - Download the video automatically
+     - Extract keyframes using scene detection
+     - Save frames to your specified folder
+     - Show progress in real-time
+
+**Important Notes for URL Downloads:**
+- Video must be publicly accessible
+- Some platforms may have regional restrictions
+- Large videos may take time to download
+- Downloaded videos are temporarily stored and then cleaned up
+- **ffmpeg is required** for video processing (installed automatically by setup scripts)
 
 ### Understanding Scene Detection
 - **Lower threshold (10-20)**: More sensitive, extracts more frames during subtle changes

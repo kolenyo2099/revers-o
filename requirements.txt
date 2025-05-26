@@ -21,6 +21,7 @@ supervision>=0.16.0
 scenedetect>=0.6.2
 imageio>=2.25.0
 imageio-ffmpeg>=0.4.8
+yt-dlp>=2024.1.1
 
 # Perception models dependency (Apple Silicon compatible)
 eva-decord==0.6.1

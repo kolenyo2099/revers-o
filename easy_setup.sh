@@ -121,6 +121,63 @@ uv pip install --upgrade pip
 print_progress "Installing dependencies from requirements.txt..."
 uv pip install -r requirements.txt
 
+# Install yt-dlp for URL video downloads
+print_progress "Installing yt-dlp for URL video downloads..."
+uv pip install "yt-dlp>=2024.1.1"
+if [ $? -eq 0 ]; then
+    print_success "yt-dlp installed successfully - URL video downloads enabled"
+else
+    print_warning "Failed to install yt-dlp - URL video downloads may not work"
+fi
+
+# Install ffmpeg (required by yt-dlp for video processing)
+print_progress "Installing ffmpeg (required for video processing)..."
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    # macOS - use Homebrew if available
+    if command -v brew &> /dev/null; then
+        brew install ffmpeg
+        if [ $? -eq 0 ]; then
+            print_success "ffmpeg installed successfully via Homebrew"
+        else
+            print_warning "Failed to install ffmpeg via Homebrew. Please install manually:"
+            print_warning "brew install ffmpeg"
+        fi
+    else
+        print_warning "Homebrew not found. Please install ffmpeg manually:"
+        print_warning "1. Install Homebrew: /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+        print_warning "2. Install ffmpeg: brew install ffmpeg"
+    fi
+else
+    # Linux - try apt-get, yum, or pacman
+    if command -v apt-get &> /dev/null; then
+        sudo apt-get update && sudo apt-get install -y ffmpeg
+        if [ $? -eq 0 ]; then
+            print_success "ffmpeg installed successfully via apt-get"
+        else
+            print_warning "Failed to install ffmpeg via apt-get. Please install manually."
+        fi
+    elif command -v yum &> /dev/null; then
+        sudo yum install -y ffmpeg
+        if [ $? -eq 0 ]; then
+            print_success "ffmpeg installed successfully via yum"
+        else
+            print_warning "Failed to install ffmpeg via yum. Please install manually."
+        fi
+    elif command -v pacman &> /dev/null; then
+        sudo pacman -S ffmpeg
+        if [ $? -eq 0 ]; then
+            print_success "ffmpeg installed successfully via pacman"
+        else
+            print_warning "Failed to install ffmpeg via pacman. Please install manually."
+        fi
+    else
+        print_warning "No supported package manager found. Please install ffmpeg manually:"
+        print_warning "Ubuntu/Debian: sudo apt-get install ffmpeg"
+        print_warning "CentOS/RHEL: sudo yum install ffmpeg"
+        print_warning "Arch: sudo pacman -S ffmpeg"
+    fi
+fi
+
 # Platform-specific installations
 if [ "$PLATFORM" == "apple" ]; then
     print_progress "Installing Apple Silicon specific packages with MPS support..."
@@ -212,8 +269,9 @@ echo "----------------"
 echo "1. Add your images to the 'my_images' folder"
 echo "2. Run './run.sh' to start the application"
 echo ""
-echo "✨ New Feature: Video Processing"
-echo "- Extract keyframes from videos using the 'Extract Images from Video' section"
+echo "✨ Video Processing Features:"
+echo "- Extract keyframes from local videos using the 'Extract Images from Video' section"
+echo "- Download videos from URLs (YouTube, Twitter, Facebook, Instagram, etc.)"
 echo "- Supports .mp4, .avi, .mov, .mkv, .wmv, .flv, .webm, .m4v formats"
 echo "- Uses intelligent scene detection and keyframe extraction"
 echo ""
