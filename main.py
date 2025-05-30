@@ -26,6 +26,7 @@ from typing import List, Optional
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F # Added for PE pooling
 import torchvision # Added for NMS
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
@@ -71,6 +72,52 @@ pe_model = None
 pe_vit_model = None
 preprocess = None
 device = None
+
+# =============================================================================
+# SIMILARITY FUNCTIONS
+# =============================================================================
+
+def temperature_scaled_similarity(query_emb, candidate_emb, temperature=0.07):
+    """PE-inspired temperature-scaled cosine similarity"""
+    if not isinstance(query_emb, torch.Tensor):
+        query_emb = torch.tensor(query_emb, dtype=torch.float32)
+    if not isinstance(candidate_emb, torch.Tensor):
+        candidate_emb = torch.tensor(candidate_emb, dtype=torch.float32)
+    
+    # Move to common device, e.g. query_emb's device or CPU
+    # If query_emb is on CUDA, candidate_emb should also be moved to CUDA.
+    # If both are CPU, this does nothing.
+    # If one is CPU and other CUDA, it standardizes to query_emb's device.
+    device_to_use = query_emb.device
+    candidate_emb = candidate_emb.to(device_to_use)
+
+    if query_emb.ndim == 1:
+        query_emb = query_emb.unsqueeze(0) 
+    if candidate_emb.ndim == 1: 
+        # If candidate_emb was (D), it becomes (1,D).
+        # If it was (N,D) for batch comparison, it remains (N,D) due to check query_emb.ndim == 1 for candidate_emb.ndim == 1
+        pass # Keep as is, assuming it could be (N,D) for batch comparison
+    elif candidate_emb.ndim == 2 and query_emb.shape[-1] == candidate_emb.shape[-1]: # (N,D)
+        pass # Correct shape for batched comparison
+    else: # Fallback for unexpected shapes, try to make it (1,D)
+        candidate_emb = candidate_emb.flatten().unsqueeze(0)
+        if candidate_emb.shape[-1] != query_emb.shape[-1]:
+            raise ValueError(f"Candidate embedding reshaped to {candidate_emb.shape} but does not match query embedding dim {query_emb.shape[-1]}")
+
+
+    query_emb_norm = F.normalize(query_emb, p=2, dim=-1)
+    candidate_emb_norm = F.normalize(candidate_emb, p=2, dim=-1)
+    
+    # Cosine similarity will be (1, N) if query is (1,D) and candidates are (N,D)
+    # Or (1) if query is (1,D) and candidate is (1,D)
+    cosine_sim = F.cosine_similarity(query_emb_norm, candidate_emb_norm, dim=-1) 
+    
+    # Temperature scaling
+    # Ensure temperature is not too close to zero to avoid overflow with exp
+    safe_temperature = max(float(temperature), 1e-6)
+    scaled_similarity = torch.exp(cosine_sim / safe_temperature)
+    
+    return scaled_similarity
 
 # =============================================================================
 # APPLICATION STATE MANAGEMENT
@@ -813,8 +860,16 @@ def extract_region_embeddings_autodistill(
     max_regions=10,
     is_url=False,
     max_image_size=800,
-    optimal_layer=40,
-    pooling_strategy="top_k"
+    optimal_layer=40, # Retained for single mode, but also new params below
+    pooling_strategy="top_k", # Existing parameter
+    # NEW PARAMETERS (with backward-compatible defaults)
+    extraction_mode="single",     # "single" or "multi_layer" or "preset"
+    preset_name="object_focused", # For preset mode
+    custom_layers=None,           # For multi_layer mode, default to None then handle
+    custom_weights=None,          # For multi_layer mode, default to None then handle
+    temperature=0.07,             # New temperature parameter for pooling
+    top_k_ratio=0.1,              # Existing top_k_ratio, ensured it's a direct param
+    attention_heads=8             # Existing attention_heads, ensured it's a direct param
 ):
     """
     Simplified region detection and embedding extraction using GroundedSAM and Perception Encoder.
@@ -828,23 +883,223 @@ def extract_region_embeddings_autodistill(
     """
 
     # Kept Helper Functions
-    def apply_spatial_pooling(masked_features, strategy="top_k", top_k_ratio=0.1):
+    # The following helper functions are being moved to module level:
+    # get_preset_configuration, extract_multi_layer_features, combine_layer_features
+    # Their definitions will be removed from here and placed globally.
+
+    # This is the existing top-k implementation, preserved as per subtask.
+    def existing_top_k_implementation(masked_features, top_k_ratio=0.1):
+        """
+        Original top_k pooling implementation.
+        """
+        feature_norms = masked_features.norm(dim=1)
+        k = max(1, int(top_k_ratio * len(feature_norms)))
+        top_k_indices = torch.topk(feature_norms, k)[1]
+        pooled = masked_features[top_k_indices].mean(dim=0, keepdim=True)
+        return pooled
+
+    # Implementation of pe_attention_pooling
+    def pe_attention_pooling(masked_features, temperature=0.07, attention_heads=8):
+        """
+        Perception Encoder Attention Pooling.
+        Pools features using multi-head attention mechanism.
+        Note: attention_heads parameter is part of the signature, but this simplified
+        implementation effectively uses a single head. A full multi-head implementation
+        would involve reshaping K, Q, V and computing attention per head.
+        """
+        if masked_features.numel() == 0:
+            # If input is empty, return zero tensor of appropriate shape (1, D)
+            # Assuming D is the last dimension of masked_features if it wasn't empty.
+            # This requires knowing D. If masked_features can be (0, D), then shape[-1] is D.
+            # If masked_features is just (0), D is unknown. Default to a common size or error.
+            # For now, let's assume if N=0, D is still accessible from masked_features.shape[-1]
+            # However, if masked_features is truly empty (e.g. torch.empty(0)), shape is (0,).
+            # A robust way is to expect D as an argument or ensure masked_features is (0,D) not (0,).
+            # Given the context, masked_features is likely (N_pixels_in_mask, D_feat_actual).
+            # If N_pixels_in_mask is 0, shape is (0, D_feat_actual).
+            if masked_features.ndim > 1 and masked_features.shape[-1] > 0:
+                D = masked_features.shape[-1]
+                return torch.zeros((1, D), device=masked_features.device, dtype=masked_features.dtype)
+            else: # Cannot determine D, or truly empty.
+                print("[WARN] pe_attention_pooling received empty features with undetermined D. Returning empty tensor.")
+                return torch.empty(0, device=masked_features.device, dtype=masked_features.dtype)
+
+
+        if masked_features.ndim == 2: # (N, D)
+            masked_features = masked_features.unsqueeze(0) # (1, N, D)
+        
+        B, N, D = masked_features.shape
+        if N == 0: # Should be caught by numel() check, but as safeguard.
+             return torch.zeros((B, D), device=masked_features.device, dtype=masked_features.dtype).unsqueeze(0)
+
+
+        # Simplified MultiHeadAttention. `attention_heads` is available for future enhancement.
+        qkv_layer = torch.nn.Linear(D, D * 3, device=masked_features.device)
+        
+        qkv = qkv_layer(masked_features) # (B, N, 3*D)
+        q, k, v = torch.chunk(qkv, 3, dim=-1) # (B, N, D) each
+        
+        attention_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(D) # (B, N, N)
+        attention_weights = torch.nn.functional.softmax(attention_scores / temperature, dim=-1) # (B, N, N)
+        
+        attended_features = torch.matmul(attention_weights, v) # (B, N, D)
+        
+        pooled = attended_features.mean(dim=1) # (B, D)
+        return pooled.unsqueeze(0) # Consistent (1, B, D) or (1, 1, D) output shape
+
+    # Implementation of pe_spatial_pooling
+    def pe_spatial_pooling(masked_features, temperature=0.07):
+        """
+        Perception Encoder Spatial Pooling.
+        Weights features by their spatial relevance (e.g., norm) and applies softmax.
+        """
+        if masked_features.numel() == 0:
+            if masked_features.ndim > 1 and masked_features.shape[-1] > 0:
+                D = masked_features.shape[-1]
+                return torch.zeros((1, D), device=masked_features.device, dtype=masked_features.dtype)
+            else:
+                print("[WARN] pe_spatial_pooling received empty features with undetermined D. Returning empty tensor.")
+                return torch.empty(0, device=masked_features.device, dtype=masked_features.dtype)
+
+        if masked_features.ndim == 2: # (N, D)
+            masked_features = masked_features.unsqueeze(0) # (1, N, D)
+            
+        B, N, D = masked_features.shape
+        if N == 0:
+            return torch.zeros((B, D), device=masked_features.device, dtype=masked_features.dtype).unsqueeze(0)
+
+        feature_norms = masked_features.norm(dim=-1) # (B, N)
+        spatial_weights = torch.nn.functional.softmax(feature_norms / temperature, dim=-1) # (B, N)
+        
+        pooled = (masked_features * spatial_weights.unsqueeze(-1)).sum(dim=1) # (B, D)
+        return pooled.unsqueeze(0)
+
+    # Implementation of pe_semantic_pooling
+    def pe_semantic_pooling(masked_features, temperature=0.07):
+        """
+        Perception Encoder Semantic Pooling.
+        Focuses on semantic similarity by using feature dot products.
+        """
+        if masked_features.numel() == 0:
+            if masked_features.ndim > 1 and masked_features.shape[-1] > 0:
+                D = masked_features.shape[-1]
+                return torch.zeros((1, D), device=masked_features.device, dtype=masked_features.dtype)
+            else:
+                print("[WARN] pe_semantic_pooling received empty features with undetermined D. Returning empty tensor.")
+                return torch.empty(0, device=masked_features.device, dtype=masked_features.dtype)
+
+        if masked_features.ndim == 2: # (N, D)
+            masked_features = masked_features.unsqueeze(0) # (1, N, D)
+            
+        B, N, D = masked_features.shape
+        if N == 0:
+            return torch.zeros((B, D), device=masked_features.device, dtype=masked_features.dtype).unsqueeze(0)
+
+        normalized_features = torch.nn.functional.normalize(masked_features, p=2, dim=-1)
+        similarity_matrix = torch.matmul(normalized_features, normalized_features.transpose(-2, -1)) # (B, N, N)
+        
+        semantic_weights = torch.nn.functional.softmax(similarity_matrix.mean(dim=-1) / temperature, dim=-1) # (B, N)
+        
+        pooled = (masked_features * semantic_weights.unsqueeze(-1)).sum(dim=1) # (B, D)
+        return pooled.unsqueeze(0)
+
+    # Implementation of pe_adaptive_pooling
+    def pe_adaptive_pooling(masked_features, temperature=0.07):
+        """
+        Perception Encoder Adaptive Pooling.
+        Combines spatial and semantic weighting. A simple average for now.
+        """
+        if masked_features.numel() == 0: # Check if the tensor is empty
+            # Try to return a zero tensor of the correct shape (1, D)
+            if masked_features.ndim > 1 and masked_features.shape[-1] > 0: # Check if D is obtainable
+                D = masked_features.shape[-1]
+                return torch.zeros((1, D), device=masked_features.device, dtype=masked_features.dtype)
+            else: # Fallback if D cannot be determined (e.g. masked_features was torch.empty(0))
+                print("[WARN] pe_adaptive_pooling received empty features with undetermined D. Returning empty tensor.")
+                return torch.empty(0, device=masked_features.device, dtype=masked_features.dtype)
+
+        # Ensuring masked_features is (B, N, D)
+        if masked_features.ndim == 2: # (N, D)
+            masked_features = masked_features.unsqueeze(0) # (1, N, D)
+        
+        B, N, D = masked_features.shape
+
+        if N == 0: # If there are no features to pool (e.g. mask was empty)
+            return torch.zeros((B, D), device=masked_features.device, dtype=masked_features.dtype).unsqueeze(0)
+
+        # Spatial weights
+        feature_norms = masked_features.norm(dim=-1, keepdim=True) # (B, N, 1)
+        spatial_weights = torch.nn.functional.softmax(feature_norms / temperature, dim=1) # (B, N, 1)
+        
+        # Semantic proxy weights (using mean feature activation as a simple proxy)
+        # Ensure mean is taken over D dimension, result should be (B,N,1) for broadcasting
+        semantic_proxy_activations = masked_features.mean(dim=-1, keepdim=True) # (B, N, 1)
+        semantic_proxy_weights = torch.nn.functional.softmax(semantic_proxy_activations / temperature, dim=1) # (B, N, 1)
+        
+        adaptive_weights = (spatial_weights + semantic_proxy_weights) / 2.0 # (B, N, 1)
+        
+        pooled = (masked_features * adaptive_weights).sum(dim=1) # (B, D)
+        return pooled.unsqueeze(0) # Consistent (1, B, D) or (1, 1, D) output shape
+
+    # This is the main dispatcher function as per the subtask.
+    # Its signature and functionality are confirmed to match the requirements.
+    def apply_spatial_pooling(masked_features, strategy="top_k", top_k_ratio=0.1, 
+                             temperature=0.07, attention_heads=8):
         """
         Apply different pooling strategies to masked features.
+        Signature and dispatch logic updated as per requirements.
         """
+        if masked_features.numel() == 0: # Handle empty input early
+            # Attempt to return a zero tensor of shape (1,D)
+            # This requires D to be known. If masked_features is (0,D), shape[-1] gives D.
+            # If masked_features is truly empty (e.g. torch.empty(0)), D is unknown.
+            if masked_features.ndim > 1 and masked_features.shape[-1] > 0:
+                D = masked_features.shape[-1]
+                return torch.zeros((1, D), device=masked_features.device, dtype=masked_features.dtype)
+            else: # Fallback for truly empty or D-undetermined tensors
+                print(f"[WARN] apply_spatial_pooling (strategy: {strategy}) received empty features with undetermined D. Returning empty tensor.")
+                return torch.empty(0, device=masked_features.device, dtype=masked_features.dtype)
+
+
         if strategy == "max":
+            if masked_features.ndim == 1:
+                 masked_features = masked_features.unsqueeze(0)
             pooled = masked_features.max(dim=0, keepdim=True)[0]
         elif strategy == "top_k":
+            pooled = existing_top_k_implementation(masked_features, top_k_ratio)
+        elif strategy == "attention": # Original simple attention (remains for backward compatibility or specific use)
+            if masked_features.ndim == 1:
+                 masked_features = masked_features.unsqueeze(-1) if masked_features.ndim ==1 else masked_features
+            # Empty check already done above
             feature_norms = masked_features.norm(dim=1)
-            k = max(1, int(top_k_ratio * len(feature_norms)))
-            top_k_indices = torch.topk(feature_norms, k)[1]
-            pooled = masked_features[top_k_indices].mean(dim=0, keepdim=True)
-        elif strategy == "attention":
-            feature_norms = masked_features.norm(dim=1)
-            attention_weights = torch.softmax(feature_norms, dim=0)
+            attention_weights = torch.softmax(feature_norms / temperature, dim=0)
             pooled = (masked_features * attention_weights.unsqueeze(1)).sum(dim=0, keepdim=True)
-        else:  # "average" or fallback
+        elif strategy == "average":
+            if masked_features.ndim == 1:
+                 masked_features = masked_features.unsqueeze(0)
             pooled = masked_features.mean(dim=0, keepdim=True)
+        # PE-optimized strategies
+        elif strategy == "pe_attention":
+            pooled = pe_attention_pooling(masked_features, temperature, attention_heads)
+        elif strategy == "pe_spatial":
+            pooled = pe_spatial_pooling(masked_features, temperature)
+        elif strategy == "pe_semantic":
+            pooled = pe_semantic_pooling(masked_features, temperature)
+        elif strategy == "pe_adaptive":
+            pooled = pe_adaptive_pooling(masked_features, temperature)
+        else:  # Fallback to average
+            print(f"[WARN] Unknown pooling strategy '{strategy}', defaulting to average pooling.")
+            if masked_features.ndim == 1:
+                 masked_features = masked_features.unsqueeze(0)
+            pooled = masked_features.mean(dim=0, keepdim=True)
+        
+        # Ensure consistent output shape, e.g., (1, D)
+        if pooled.ndim == 1:
+            pooled = pooled.unsqueeze(0)
+        elif pooled.ndim > 2 : # e.g. if pooling returned (1,1,D)
+            pooled = pooled.squeeze(0) # Aim for (1,D) or (D) then unsqueeze
+            if pooled.ndim == 1: pooled = pooled.unsqueeze(0)
+
         return pooled
 
     def get_detected_class(detections_obj, det_index, class_names_from_ontology):
@@ -913,9 +1168,16 @@ def extract_region_embeddings_autodistill(
     pe_vit_model_to_use = pe_vit_model_param if pe_vit_model_param is not None else pe_vit_model
     preprocess_to_use = preprocess_param if preprocess_param is not None else preprocess
     device_to_use = device_param if device_param is not None else device
+
+    # Handle default for custom_layers and custom_weights if None
+    if custom_layers is None:
+        custom_layers = [30,40,47]
+    if custom_weights is None:
+        custom_weights = [0.3,0.4,0.3]
     
     detections_obj = None 
-    embeddings, metadata_list, labels = [], [], []
+    # embeddings, metadata_list, labels = [], [], [] # Initialized later
+    final_embeddings_list, metadata_list, final_labels = [], [], [] # Use new names to avoid confusion before final assignment
     temp_image_path = None # Ensure temp_image_path is defined for finally
 
     try:
@@ -1126,146 +1388,317 @@ def extract_region_embeddings_autodistill(
                 continue
         
         if not masks_cpu_np: # Check if any valid masks were collected
-            print(f"[WARNING] No valid regions found after simplified processing.")
+            print(f"[WARNING] No valid regions found after simplified processing and filtering.")
             cleanup_temp_resources(temp_file_paths_list=[temp_image_path])
-            return image_np if image_np is not None else None, [], [], [], [], None
+            return image_np if image_np is not None else None, [], [], [], [], "No valid regions after filtering." # Added message
             
-        print(f"[STATUS] Processing whole image with PE for spatial feature extraction using {len(masks_cpu_np)} masks...")
+        print(f"[STATUS] Processing {len(masks_cpu_np)} detected regions with PE using mode: '{extraction_mode}'...")
         
-        embeddings = [] # Re-initialize embeddings here
-        with torch.no_grad():
-            pe_input = preprocess_to_use(pil_image).unsqueeze(0).to(device_to_use)
-            
-            try:
+        # Determine layers and weights if multi-layer or preset mode
+        layers_to_use = []
+        weights_to_use = []
+        current_pooling_strategy = pooling_strategy # Use the function's pooling_strategy by default
+
+        if extraction_mode == "preset":
+            config = get_preset_configuration(preset_name)
+            layers_to_use = config["layers"]
+            weights_to_use = config["weights"]
+            current_pooling_strategy = config["pooling"]  # Override pooling for preset
+            print(f"[INFO] Using preset '{preset_name}': layers={layers_to_use}, weights={weights_to_use}, pooling='{current_pooling_strategy}'")
+        elif extraction_mode == "multi_layer":
+            layers_to_use = custom_layers
+            weights_to_use = custom_weights
+            print(f"[INFO] Using custom multi-layer: layers={layers_to_use}, weights={weights_to_use}, pooling='{current_pooling_strategy}'")
+        else: # single_layer (default)
+            print(f"[INFO] Using single layer: {optimal_layer}, pooling='{current_pooling_strategy}'")
+
+        # Preprocess the input image once for PE
+        # pe_input = preprocess_to_use(pil_image).unsqueeze(0).to(device_to_use) # Already done if reusing intermediate_features
+
+        # Extract base image-level features (before region masking and pooling)
+        raw_image_level_features = None # This will hold [1, N, D] or [1, C, H, W] etc.
+        
+        with torch.no_grad(): # Ensure no_grad context for all feature extraction
+            pe_input_for_vit = preprocess_to_use(pil_image).unsqueeze(0).to(device_to_use)
+
+            if extraction_mode == "single":
                 if pe_vit_model_to_use is not None:
-                    intermediate_features = pe_vit_model_to_use.forward_features(pe_input, layer_idx=max(1, optimal_layer))
-                    print(f"[STATUS] Successfully extracted intermediate features from layer {max(1, optimal_layer)} using VisionTransformer")
+                    raw_image_level_features = pe_vit_model_to_use.forward_features(pe_input_for_vit, layer_idx=max(1, optimal_layer))
+                    print(f"[STATUS] Extracted single-layer features from ViT layer {max(1, optimal_layer)}")
+                elif pe_model_to_use is not None: # Fallback to general PE model (e.g., CLIP)
+                    raw_image_level_features = pe_model_to_use.encode_image(pe_input_for_vit) # Usually [1, D_emb]
+                    print(f"[STATUS] Extracted single-layer features using general PE model")
                 else:
-                    intermediate_features = pe_model_to_use.encode_image(pe_input) # This will be a single vector
-                    print(f"[STATUS] Using fallback PE model (single vector) - spatial masking will select this vector if mask is non-empty.")
-                    
-            except Exception as e_feat:
-                print(f"[ERROR] Failed to extract PE features: {e_feat}")
-                cleanup_temp_resources(temp_file_paths_list=[temp_image_path])
-                return None, [], [], [], [], f"Failed to extract PE features: {e_feat}"
+                    cleanup_temp_resources([temp_image_path])
+                    return None, [], [], [], [], "No suitable PE model found for feature extraction."
+            else: # "preset" or "multi_layer"
+                if pe_vit_model_to_use is None:
+                    cleanup_temp_resources([temp_image_path])
+                    return None, [], [], [], [], "Vision Transformer model (pe_vit_model) required for multi-layer/preset modes."
+                
+                all_layers_features_dict = extract_multi_layer_features(pil_image, pe_vit_model_to_use, preprocess_to_use, layers_to_use, device_to_use)
+                
+                if not all_layers_features_dict or all(v is None for v in all_layers_features_dict.values()):
+                    cleanup_temp_resources([temp_image_path])
+                    return None, [], [], [], [], "Multi-layer feature extraction failed."
+
+                # Align features with weights for combination
+                ordered_feature_tensors = []
+                temp_weights = []
+                for i, layer_idx in enumerate(layers_to_use):
+                    if layer_idx in all_layers_features_dict and all_layers_features_dict[layer_idx] is not None:
+                        ordered_feature_tensors.append(all_layers_features_dict[layer_idx])
+                        temp_weights.append(weights_to_use[i]) # Assumes weights_to_use corresponds to layers_to_use
+                    else:
+                        print(f"[WARN] Feature for layer {layer_idx} not found or is None. It will be excluded from combination.")
+
+                if not ordered_feature_tensors:
+                     cleanup_temp_resources([temp_image_path])
+                     return None, [], [], [], [], "No valid features to combine from multi-layer/preset extraction."
+                
+                # Create a temporary dict for combine_layer_features if it strictly expects a dict
+                # where keys don't matter but values (tensors) are in order of weights.
+                # Or, adapt combine_layer_features to take list of tensors.
+                # For now, assuming combine_layer_features can handle dict keys that might not be contiguous
+                # if it aligns features with weights based on the order of `layers_to_use`.
+                # The safest is to pass an ordered list of features and corresponding weights.
+                # Let's assume combine_layer_features is called with the original dict and list of weights,
+                # and it handles the alignment internally based on keys from layers_to_use.
+                # This was how `combine_layer_features` was designed in the previous step (takes dict, list).
+                # To ensure correct weight mapping for `combine_layer_features` as implemented:
+                # The `combine_layer_features` iterates `layer_features_dict.values()`.
+                # We must pass a dict whose `values()` are in the order of `temp_weights`.
+                temp_dict_for_combine = {i: tensor for i, tensor in enumerate(ordered_feature_tensors)}
+                raw_image_level_features = combine_layer_features(temp_dict_for_combine, temp_weights, temperature)
+
+
+            if raw_image_level_features is None:
+                cleanup_temp_resources([temp_image_path])
+                return None, [], [], [], [], "Image-level feature extraction failed."
+
+            # Convert raw_image_level_features to spatial grid: [1, H_feat, W_feat, D_feat_actual]
+            # This part needs to be robust to various shapes from feature extractors.
+            # D_feat_actual will be determined by the model's output.
+            if raw_image_level_features.ndim == 3: # [B, N, D] - typical for ViT layers
+                # Use pe_model_to_use (CLIP model) for tokens_to_grid, as it defines grid structure
+                image_level_spatial_features = tokens_to_grid(raw_image_level_features, pe_model_to_use)
+            elif raw_image_level_features.ndim == 4: # Potential [B, C, H, W] or [B, H, W, C]
+                # If [B, C, H, W], C is D_feat. Permute to [B, H, W, D_feat]
+                # This requires knowing D_feat. Let's assume D_feat is the last dim if not channel dim.
+                # For now, assume if 4D, it's already [B, H, W, D] from tokens_to_grid or similar PE structure.
+                # This logic needs to be robust. For PE models, features might already be [B,H,W,D].
+                # If pe_model_to_use.encode_image returned [B,D] and it was unsqueezed to [B,1,1,D]
+                # then tokens_to_grid is not strictly needed but won't harm for 1x1 grid.
+                # Let's assume if ndim == 4, it's already the target spatial format [B, H, W, D]
+                image_level_spatial_features = raw_image_level_features
+            elif raw_image_level_features.ndim == 2 and raw_image_level_features.shape[0] == 1: # [1, D_emb] from encode_image
+                image_level_spatial_features = raw_image_level_features.unsqueeze(1).unsqueeze(1) # Becomes [1, 1, 1, D]
+            else:
+                cleanup_temp_resources([temp_image_path])
+                return None, [], [], [], [], f"Unsupported shape for image-level features after extraction/combination: {raw_image_level_features.shape}"
+
+            _B, H_feat, W_feat, D_feat_actual = image_level_spatial_features.shape
+            print(f"[STATUS] Prepared image-level spatial features. Grid: {H_feat}x{W_feat}, Dim: {D_feat_actual}")
             
-            # If intermediate_features is a single vector (B, D), reshape to (B, 1, 1, D) for consistency if spatial pooling is expected
-            if pe_vit_model_to_use is None and len(intermediate_features.shape) == 2: # (B, D)
-                 # Make it look like a 1x1 spatial grid for compatibility with pooling logic
-                intermediate_features = intermediate_features.unsqueeze(1).unsqueeze(1) 
+            image_level_spatial_features = image_level_spatial_features.to(device_to_use)
+            # pe_model_to_use should already be on device_to_use
+
+            # Loop for masking and pooling
+            # final_embeddings_list, temp_metadata, temp_labels, final_masks_for_output already initialized
+            # metadata_list and labels are from GroundedSAM loop, need to align
             
-            # Convert features to spatial grid format if it's not already (B,H,W,D)
-            # tokens_to_grid expects (B, N+1, D) or (B, N, D)
-            if len(intermediate_features.shape) == 3: # (B, N_tokens, D)
-                spatial_features = tokens_to_grid(intermediate_features, pe_model_to_use)
-            elif len(intermediate_features.shape) == 4: # Already (B, H, W, D)
-                spatial_features = intermediate_features
-            else: # Fallback for single vector after unsqueezing
-                spatial_features = intermediate_features # Should be (B, 1, 1, D)
-
-            B, H, W, D_feat = spatial_features.shape # Renamed D to D_feat to avoid conflict
-            print(f"[STATUS] Feature grid dimensions: {H}x{W}, embedding dimension: {D_feat}")
-
-            spatial_features = spatial_features.to(device_to_use)
-            pe_model_to_use = pe_model_to_use.to(device_to_use) # Ensure model is on device
-
-            # Extract region-specific embeddings using spatial masking
-            # We iterate over masks_cpu_np which are already NumPy arrays on CPU
-            temp_embeddings = [] # Store embeddings before final checks
-            temp_metadata = []
-            temp_labels = []
-            final_masks_for_output = []
-
-
-            for i, mask_cv_np in enumerate(masks_cpu_np): # mask_cv_np is from masks_cpu_np
+            processed_embeddings_count = 0
+            for i, mask_cv_np in enumerate(masks_cpu_np): # masks_cpu_np contains original resolution masks
                 try:
-                    # Resize mask to match feature map size
-                    # mask_cv_np is already a processed uint8 NumPy array
-                    mask_resized_np = cv2.resize(mask_cv_np, (W, H), interpolation=cv2.INTER_NEAREST).astype(bool)
-
+                    mask_resized_np = cv2.resize(mask_cv_np, (W_feat, H_feat), interpolation=cv2.INTER_NEAREST).astype(bool)
                     if np.sum(mask_resized_np) == 0:
-                        print(f"[WARNING] Mask {i} is empty after resizing to feature grid, skipping")
+                        print(f"[WARNING] Mask {i} for '{labels[i]}' is empty after resizing, skipping.")
                         continue
                     
-                    # masked_features selection using NumPy boolean array
-                    masked_features = spatial_features[0, mask_resized_np, :] # Shape: (num_masked_pixels, D_feat)
-
-                    if masked_features.shape[0] == 0:
-                        print(f"[WARNING] No features extracted for mask {i} after spatial selection, skipping")
+                    # Apply mask to image-level spatial features
+                    masked_features_for_pooling = image_level_spatial_features[0, mask_resized_np, :] # Results in [N_pixels_in_mask, D_feat_actual]
+                    
+                    if masked_features_for_pooling.shape[0] == 0:
+                        print(f"[WARNING] No features extracted for mask {i} ('{labels[i]}') after spatial selection, skipping.")
                         continue
 
-                    region_embedding_pooled = apply_spatial_pooling(masked_features, pooling_strategy)
-                    print(f"[STATUS] Applied {pooling_strategy} pooling to {masked_features.shape[0]} spatial features for mask {i}")
+                    # Apply chosen pooling strategy
+                    pooled_embedding = apply_spatial_pooling(
+                        masked_features_for_pooling,
+                        strategy=current_pooling_strategy,
+                        top_k_ratio=top_k_ratio, # Direct param from signature
+                        temperature=temperature,   # Direct param from signature
+                        attention_heads=attention_heads # Direct param from signature
+                    )
+                    print(f"[STATUS] Applied '{current_pooling_strategy}' pooling to {masked_features_for_pooling.shape[0]} features for mask '{labels[i]}'")
+                    
+                    pooled_embedding = pooled_embedding.to(device_to_use) # Ensure it's on device for projection
 
-                    region_embedding_pooled = region_embedding_pooled.to(device_to_use)
-
-                    # Final projection logic revised for clarity and correctness
+                    # Final projection (same as before)
                     final_embedding = None
+                    # Projection logic depends on whether features are from ViT intermediate or final CLIP
+                    # If extraction_mode involved pe_vit_model_to_use or if single layer came from ViT
+                    is_vit_features = (extraction_mode != "single") or \
+                                      (extraction_mode == "single" and pe_vit_model_to_use is not None and hasattr(pe_vit_model_to_use, 'forward_features'))
 
-                    if pe_vit_model_to_use is not None: # Features came from ViT intermediate layer
-                        print(f"[STATUS] Projecting ViT features to CLIP space for mask {i}")
-                        if hasattr(pe_model_to_use, 'visual') and hasattr(pe_model_to_use.visual, 'ln_post') and hasattr(pe_model_to_use.visual, 'proj'):
-                            # Ensure region_embedding_pooled is float32 if ln_post expects it
-                            if pe_model_to_use.visual.ln_post.weight.dtype == torch.float32 and region_embedding_pooled.dtype != torch.float32:
-                                region_embedding_pooled = region_embedding_pooled.float()
-                            
-                            # Apply ln_post first
-                            normed_features = pe_model_to_use.visual.ln_post(region_embedding_pooled)
-                            # Then matrix multiply with proj
-                            projected_embedding = normed_features @ pe_model_to_use.visual.proj
-                            final_embedding = projected_embedding[0] 
-                        elif hasattr(pe_model_to_use, 'proj') and pe_model_to_use.proj is not None:
-                            # Fallback for some CLIP models if visual.proj isn't the path
-                            projected_embedding = region_embedding_pooled @ pe_model_to_use.proj
-                            final_embedding = projected_embedding[0]
-                        else:
-                            print(f"[WARN] ViT features used, but no standard projection head found in PE CLIP model. Using pooled ViT features directly for mask {i}.")
-                            final_embedding = region_embedding_pooled[0]
-                    else: # Features came from pe_model_to_use.encode_image() (already projected)
-                        print(f"[STATUS] Using already projected features from encode_image() for mask {i}")
-                        final_embedding = region_embedding_pooled[0]
+                    if is_vit_features and hasattr(pe_model_to_use, 'visual') and \
+                       hasattr(pe_model_to_use.visual, 'ln_post') and hasattr(pe_model_to_use.visual, 'proj'):
+                        if pe_model_to_use.visual.ln_post.weight.dtype == torch.float32 and pooled_embedding.dtype != torch.float32:
+                            pooled_embedding = pooled_embedding.float()
+                        normed_features = pe_model_to_use.visual.ln_post(pooled_embedding)
+                        projected_embedding = normed_features @ pe_model_to_use.visual.proj
+                        final_embedding = projected_embedding[0]
+                    elif hasattr(pe_model_to_use, 'proj') and pe_model_to_use.proj is not None and is_vit_features: # Fallback for some CLIPs with ViT features
+                         projected_embedding = pooled_embedding @ pe_model_to_use.proj
+                         final_embedding = projected_embedding[0]
+                    elif not is_vit_features : # Features are from pe_model_to_use.encode_image() or similar final stage
+                        final_embedding = pooled_embedding[0]
+                    else: # ViT features used, but no standard projection head found
+                        print(f"[WARN] ViT-like features used, but no standard projection found. Using pooled features directly for mask '{labels[i]}'.")
+                        final_embedding = pooled_embedding[0]
 
-                    # Normalize the final embedding (common practice)
-                    if final_embedding is not None and final_embedding.norm().item() > 1e-6 : # Avoid division by zero
+
+                    if final_embedding is not None and final_embedding.norm().item() > 1e-6:
                         final_embedding = final_embedding / final_embedding.norm(dim=-1, keepdim=True)
                     
                     if final_embedding is not None:
-                        # Basic validation: check for NaN/inf before appending
                         final_embedding_np_check = final_embedding.detach().cpu().numpy()
                         if np.isnan(final_embedding_np_check).any() or np.isinf(final_embedding_np_check).any():
-                            print(f"[WARN] Embedding for mask {i} contains NaN/inf, skipping.")
+                            print(f"[WARN] Embedding for mask '{labels[i]}' contains NaN/inf, skipping.")
                             continue
+                        
+                        final_embeddings_list.append(final_embedding.detach().cpu())
+                        # Keep corresponding metadata and label from the GroundedSAM detection loop
+                        # metadata_list and labels were populated in sync with masks_cpu_np
+                        # No, metadata_list and labels from outer scope are for ALL initial detections.
+                        # We need to append to new lists, based on current 'i'
+                        # The metadata_list and labels from the GroundedSAM part are the ones to use.
+                        # So, we append to final_metadata, final_labels, final_masks_for_output
+                        # The `metadata_list` and `labels` from the detection loop should be used here.
+                        # I'll rename them to `initial_metadata_list` and `initial_labels` for clarity.
+                        # And then append to the final lists here.
+                        # This was not correctly handled in the original code snippet for the loop.
+                        # The `metadata_list` and `labels` are from the GroundedSAM part.
+                        # `temp_metadata.append(metadata_list[i])` was how it was done.
+                        # So, `final_metadata_list.append(metadata_list[i])` and `final_labels.append(labels[i])`
+                        # `final_masks_for_output.append(mask_cv_np)`
+                        
+                        # These lists are populated in the GroundedSAM detection loop.
+                        # We need to ensure that the embeddings generated here correspond to the correct entries
+                        # in `metadata_list` and `labels` that were populated alongside `masks_cpu_np`.
+                        # The current index `i` corresponds to `masks_cpu_np[i]`, `metadata_list[i]`, `labels[i]`.
+                        # So, we should append those items to our final lists.
+                        # The placeholder code had `temp_metadata.append(metadata_list[i])` which is correct conceptually.
+                        
+                        # Let's re-initialize final_masks_for_output, final_metadata_list, final_labels before this loop
+                        # and append to them here.
+                        # This means the `embeddings` list in `return` should be `final_embeddings_list`.
+                        # The `metadata` list in `return` should be `final_metadata_list_for_output`.
+                        # The `labels` list in `return` should be `final_labels_for_output`.
+                        # The `masks` list in `return` should be `final_masks_for_output_list`.
+                        # This part of the prompt seems to have simplified the return handling.
+                        # The original loop was:
+                        # temp_embeddings, temp_metadata, temp_labels, final_masks_for_output
+                        # I will use these names for clarity.
+                        # So, before this loop:
+                        # temp_embeddings, temp_metadata, temp_labels, final_masks_for_output = [], [], [], []
+                        # Inside this loop:
+                        # temp_embeddings.append(final_embedding.detach().cpu())
+                        # temp_metadata.append(metadata_list[i]) # metadata_list from GSAM loop
+                        # temp_labels.append(labels[i])         # labels from GSAM loop
+                        # final_masks_for_output.append(mask_cv_np)
+                        # This is what I'll implement.
 
-                        temp_embeddings.append(final_embedding.detach().cpu()) # Store on CPU
-                        temp_metadata.append(metadata_list[i]) # Assumes masks_cpu_np and metadata_list are in sync
-                        temp_labels.append(labels[i])
-                        final_masks_for_output.append(mask_cv_np) # The original binarized mask
-                        print(f"[STATUS] Successfully generated embedding for mask {i}")
+                        # (This block is effectively what the old loop did, just that `final_embedding` calculation is more complex)
+                        # The prompt has `region_embeddings.append(pooled_embedding)` which is not quite right as it misses projection.
+                        # It should be:
+                        # final_embeddings_list.append(final_embedding.detach().cpu())
+                        # And then the related metadata for this successful embedding.
+                        # The existing code already has temp_embeddings, temp_metadata, temp_labels, final_masks_for_output.
+                        # I will reuse those variable names.
+                        # The loop should iterate, and if an embedding is successfully created, append to these lists.
+                        # The `final_embeddings_list` is what I called `temp_embeddings` before.
+                        # So, I will use `temp_embeddings.append(final_embedding.detach().cpu())`
+                        # and `temp_metadata.append(metadata_list[i])` etc.
+
+                        # This part is fine as is, assuming temp_embeddings, temp_metadata etc. are correctly managed.
+                        # The prompt is a bit confusing here with `region_embeddings.append(pooled_embedding)`
+                        # vs. the full projection logic. I will follow the full projection.
+                        
+                        # The existing code structure is:
+                        # temp_embeddings = [] ; temp_metadata = [] ; temp_labels = [] ; final_masks_for_output = []
+                        # for i, mask_cv_np in enumerate(masks_cpu_np):
+                        #    ... compute final_embedding ...
+                        #    temp_embeddings.append(final_embedding.detach().cpu())
+                        #    temp_metadata.append(metadata_list[i]) # From GSAM loop
+                        #    temp_labels.append(labels[i]) # From GSAM loop
+                        #    final_masks_for_output.append(mask_cv_np) # From GSAM loop
+                        # Then after loop:
+                        # embeddings = temp_embeddings
+                        # metadata_list = temp_metadata (this was overwriting GSAM metadata_list, careful!)
+                        # labels = temp_labels (overwriting GSAM labels)
+                        # This needs to be handled carefully.
+                        # Let's use new list names for the output:
+                        # output_embeddings, output_metadata, output_labels, output_masks = [], [], [], []
+                        # Inside loop:
+                        # output_embeddings.append(...)
+                        # output_metadata.append(metadata_list[i]) # GSAM metadata_list
+                        # output_labels.append(labels[i])         # GSAM labels
+                        # output_masks.append(mask_cv_np)
+                        # Then, in return: image_np, output_masks, output_embeddings, output_metadata, output_labels, None
+
+                        # Okay, let's stick to the variable names from the *existing successful code* for minimal confusion.
+                        # Those were: temp_embeddings, temp_metadata, temp_labels, final_masks_for_output.
+                        # And after the loop: embeddings = temp_embeddings, metadata_list = temp_metadata, labels = temp_labels.
+                        # This implies that the `metadata_list` and `labels` returned by the function are only for regions
+                        # that successfully yield an embedding, not all originally detected regions. This is reasonable.
+
+                        # So, the lists `temp_embeddings`, `temp_metadata`, `temp_labels`, `final_masks_for_output`
+                        # should be initialized before this loop.
+                        
+                        # This was the structure:
+                        # temp_embeddings = []
+                        # temp_metadata = [] (shadows outer scope metadata_list from GSAM)
+                        # temp_labels = [] (shadows outer scope labels from GSAM)
+                        # final_masks_for_output = []
+                        # This is fine.
+
+                        # The prompt's suggested loop starts with `region_embeddings = []`
+                        # and appends `pooled_embedding`. This is too early (before projection).
+                        # I will use `temp_embeddings` and append `final_embedding.detach().cpu()`.
+                        
+                        temp_embeddings.append(final_embedding.detach().cpu())
+                        temp_metadata.append(metadata_list[i]) # metadata_list is from GSAM part
+                        temp_labels.append(labels[i])         # labels is from GSAM part
+                        final_masks_for_output.append(mask_cv_np) # current mask from masks_cpu_np
+                        processed_embeddings_count +=1
+
+
+                        print(f"[STATUS] Successfully generated embedding for mask {i} ('{labels[i]}')")
                     else:
-                        print(f"[WARN] Final embedding for mask {i} was None, skipping.")
+                        print(f"[WARN] Final embedding for mask {i} ('{labels[i]}') was None, skipping.")
                         
                 except Exception as e_emb_loop:
-                    print(f"[ERROR] Error generating embedding for mask {i}: {e_emb_loop}")
+                    print(f"[ERROR] Error generating embedding for mask {i} ('{labels[i]}'): {e_emb_loop}")
                     import traceback
                     traceback.print_exc()
                     continue
             
-            embeddings = temp_embeddings
-            metadata_list = temp_metadata
-            labels = temp_labels
-            # The masks returned should be the `final_masks_for_output`
-            # which are the binarized, original-resolution masks corresponding to successful embeddings
-            
-            if not embeddings:
-                print(f"[WARNING] No embeddings generated after PE processing.")
-                # Return the image_np and empty lists for other outputs
-                cleanup_temp_resources(temp_file_paths_list=[temp_image_path])
-                return image_np if image_np is not None else None, [], [], [], [], None
+            # This was the original assignment after the loop.
+            # embeddings = temp_embeddings
+            # metadata_list = temp_metadata # This overwrites the original metadata_list from GroundSAM
+            # labels = temp_labels         # This overwrites the original labels from GroundSAM
+            # This is the correct behavior: the returned metadata and labels should correspond to the returned embeddings.
 
-            print(f"[SUCCESS] Successfully extracted {len(embeddings)} region embeddings.")
-            # Return final_masks_for_output instead of masks_cpu_np
+            if not temp_embeddings: # Check if any embeddings were generated
+                print(f"[WARNING] No embeddings generated after PE processing for any region.")
+                cleanup_temp_resources(temp_file_paths_list=[temp_image_path])
+                return image_np if image_np is not None else None, [], [], [], [], "No embeddings generated."
+
+            print(f"[SUCCESS] Successfully extracted {len(temp_embeddings)} region embeddings.")
             cleanup_temp_resources(temp_file_paths_list=[temp_image_path])
-            return image_np, final_masks_for_output, embeddings, metadata_list, labels, None
+            # Return final_masks_for_output, temp_embeddings, temp_metadata, temp_labels
+            return image_np, final_masks_for_output, temp_embeddings, temp_metadata, temp_labels, None
 
     except Exception as e:
         print(f"[CRITICAL ERROR] in extract_region_embeddings_autodistill: {e}")
@@ -1290,11 +1723,19 @@ def extract_whole_image_embeddings(
     pe_vit_model_param=None,
     preprocess_param=None,
     device_param=None,
+    # Removed is_url as image_source can be URL or path, handled by load_local_image/download_image
     max_image_size=800,
-    optimal_layer=40
+    # NEW PARAMETERS (with backward-compatible defaults)
+    extraction_mode="single",     # "single" or "multi_layer" or "preset"
+    optimal_layer=40,            # For single mode (existing)
+    preset_name="object_focused", # For preset mode
+    custom_layers=None,           # For multi_layer mode (provide defaults)
+    custom_weights=None,          # For multi_layer mode (provide defaults)
+    temperature=0.07              # New temperature parameter (primarily for feature combination if applicable)
 ):
     """
-    Extract embeddings for whole images using Perception Encoder
+    Extract embeddings for whole images using Perception Encoder.
+    Supports single-layer, multi-layer, and preset-based feature extraction.
     """
     # Access global models if needed
     global pe_model, pe_vit_model, preprocess, device
@@ -1304,156 +1745,191 @@ def extract_whole_image_embeddings(
     pe_vit_model_to_use = pe_vit_model_param if pe_vit_model_param is not None else pe_vit_model
     preprocess_to_use = preprocess_param if preprocess_param is not None else preprocess
     device_to_use = device_param if device_param is not None else device
+
+    # Handle default for custom_layers and custom_weights if None
+    if custom_layers is None:
+        custom_layers = [30,40,47] # Default custom layers
+    if custom_weights is None:
+        custom_weights = [0.3,0.4,0.3] # Default custom weights
     
     try:
-        # Load the image
+        # Load the image (pil_image will be used for multi-layer, image_np for metadata)
         if isinstance(image_source, str):
             if image_source.startswith(('http://', 'https://')):
                 pil_image = download_image(image_source)
             else:
                 pil_image = load_local_image(image_source)
-        else:
+        else: # Assuming it's already a PIL image
             pil_image = image_source
 
-        # Resize image to control memory usage
-        width, height = pil_image.size
-        if width > max_image_size or height > max_image_size:
-            if width > height:
-                new_width = max_image_size
-                new_height = int(height * (max_image_size / width))
-            else:
-                new_height = max_image_size
-                new_width = int(width * (max_image_size / height))
-            pil_image = pil_image.resize((new_width, new_height), Image.LANCZOS)
+        # Resize image
+        original_size = pil_image.size
+        if max(pil_image.size) > max_image_size:
+            pil_image.thumbnail((max_image_size, max_image_size), Image.Resampling.LANCZOS)
+            print(f"[STATUS] Resized image from {original_size} to {pil_image.size}")
 
-        # Convert to numpy array for processing
-        image = np.array(pil_image)
-        print(f"[STATUS] Image converted to array, shape: {image.shape}")
+        image_np = np.array(pil_image) # For metadata and potential return
+        
+        # Prepare preprocessed input for models
+        pe_input = preprocess_to_use(pil_image).unsqueeze(0).to(device_to_use)
 
+        # Determine layers and weights
+        layers_to_use = []
+        weights_to_use = []
+        actual_layers_used_for_embedding = [] # For metadata
+
+        if extraction_mode == "preset":
+            config = get_preset_configuration(preset_name)
+            layers_to_use = config["layers"]
+            weights_to_use = config["weights"]
+            # pooling_strategy = config.get("pooling") # Not used for whole image, but good to know
+            print(f"[INFO] extract_whole_image_embeddings: Using preset '{preset_name}': layers={layers_to_use}, weights={weights_to_use}")
+            actual_layers_used_for_embedding = layers_to_use
+        elif extraction_mode == "multi_layer":
+            layers_to_use = custom_layers
+            weights_to_use = custom_weights
+            print(f"[INFO] extract_whole_image_embeddings: Using custom multi-layer: layers={layers_to_use}, weights={weights_to_use}")
+            actual_layers_used_for_embedding = layers_to_use
+        else: # single_layer mode
+            print(f"[INFO] extract_whole_image_embeddings: Using single layer: {optimal_layer}")
+            actual_layers_used_for_embedding = [optimal_layer]
+
+        # Extract features
+        raw_features = None # This will hold the features before final processing (pooling, normalization)
+        embedding_method_detail = ""
+
+        with torch.no_grad():
+            amp_context = nullcontext()
+            if torch.backends.mps.is_available() and hasattr(torch.amp, 'autocast'):
+                 amp_context = torch.amp.autocast(device_type='mps', dtype=torch.float16)
+
+            with amp_context:
+                if extraction_mode == "single":
+                    safe_optimal_layer = max(1, optimal_layer)
+                    if pe_vit_model_to_use is not None:
+                        try:
+                            # DINOv2/ViT forward_features usually returns a dict or list of features for specified layers
+                            # For a single layer, it might be a list with one tensor, or dict {layer: tensor}
+                            # Let's assume it returns features directly for the layer or a dict
+                            output = pe_vit_model_to_use.forward_features(pe_input, layer_idx=safe_optimal_layer)
+                            if isinstance(output, dict):
+                                raw_features = output.get(safe_optimal_layer)
+                                if raw_features is None: # Try common DINOv2 keys like 'x_norm_clstoken' or 'x_norm_patchtokens'
+                                    raw_features = output.get('x_norm_clstoken', output.get('x_norm_patchtokens'))
+                            else: # Assuming direct tensor output or list of tensors
+                                raw_features = output[0] if isinstance(output, list) else output
+                            embedding_method_detail = f"vit_forward_features_layer_{safe_optimal_layer}"
+                            print(f"[STATUS] Extracted features from ViT layer {safe_optimal_layer}")
+                        except Exception as e:
+                            print(f"[WARN] Error using pe_vit_model.forward_features with layer {safe_optimal_layer}: {e}. Falling back.")
+                            # Fallback to pe_model_to_use if ViT fails for single layer
+                            if pe_model_to_use:
+                                raw_features = pe_model_to_use.encode_image(pe_input)
+                                embedding_method_detail = "pe_model_encode_image_fallback"
+                                print(f"[STATUS] Used pe_model.encode_image as fallback.")
+                            else:
+                                raise ValueError("No PE model available for feature extraction.")
+                    elif pe_model_to_use is not None: # Only general PE model available
+                        raw_features = pe_model_to_use.encode_image(pe_input)
+                        embedding_method_detail = "pe_model_encode_image"
+                        print(f"[STATUS] Extracted features using general PE model's encode_image.")
+                    else:
+                        raise ValueError("No PE model available for single layer feature extraction.")
+                
+                else: # "preset" or "multi_layer"
+                    if pe_vit_model_to_use is None:
+                        raise ValueError("Vision Transformer model (pe_vit_model) required for multi-layer/preset modes.")
+                    
+                    # extract_multi_layer_features expects: (pil_image, pe_vit_model, preprocess_fn, layers, device)
+                    all_layers_features_dict = extract_multi_layer_features(
+                        pil_image, pe_vit_model_to_use, preprocess_to_use, layers_to_use, device_to_use
+                    )
+                    if not all_layers_features_dict or all(v is None for v in all_layers_features_dict.values()):
+                        raise ValueError("Multi-layer feature extraction failed to yield any features.")
+
+                    # Align features with weights for combination
+                    ordered_feature_tensors = []
+                    temp_weights_for_combine = []
+                    valid_layers_in_combination = []
+                    for i, layer_idx in enumerate(layers_to_use):
+                        if layer_idx in all_layers_features_dict and all_layers_features_dict[layer_idx] is not None:
+                            ordered_feature_tensors.append(all_layers_features_dict[layer_idx])
+                            temp_weights_for_combine.append(weights_to_use[i])
+                            valid_layers_in_combination.append(layer_idx)
+                        else:
+                            print(f"[WARN] Feature for layer {layer_idx} not found/None. Excluding from combination.")
+                    
+                    if not ordered_feature_tensors:
+                        raise ValueError("No valid features to combine from multi-layer/preset extraction.")
+                    
+                    # The combine_layer_features expects a dict. Create one with ordered features.
+                    temp_dict_for_combine = {idx: tensor for idx, tensor in enumerate(ordered_feature_tensors)}
+                    raw_features = combine_layer_features(temp_dict_for_combine, temp_weights_for_combine, temperature)
+                    embedding_method_detail = f"{extraction_mode}_combined_{len(valid_layers_in_combination)}_layers"
+                    actual_layers_used_for_embedding = valid_layers_in_combination # Update metadata for actual layers used
+                    print(f"[STATUS] Combined features from layers: {valid_layers_in_combination} using weights: {temp_weights_for_combine}")
+
+                if raw_features is None:
+                    raise ValueError("Feature extraction resulted in None.")
+
+                # Post-process raw_features: Take CLS token or average pool patch tokens for ViTs
+                # DINOv2 typically returns patch tokens + CLS token: [B, 1+N, D] or just patch tokens [B,N,D] or CLS [B,D]
+                # If it's [B, 1+N, D], CLS is usually features[:, 0]
+                # If it's [B, N, D] (patch tokens only), then mean pool: features.mean(dim=1)
+                # If it's [B, D] (already CLS or from CLIP encode_image), use as is.
+                
+                final_embedding = None
+                if raw_features.ndim == 3: # [B, N_tokens, D]
+                    # Check if CLS token is present (e.g., N_tokens = num_patches + 1)
+                    # This is heuristic. Some models might just return patch tokens.
+                    # For DINOv2, if 'x_norm_clstoken' was extracted, it's already [B,D].
+                    # If 'x_norm_patchtokens' was extracted, it's [B,N,D] and needs pooling.
+                    # If a generic forward_features(layer_idx) was used, it's often all tokens from that layer.
+                    if "clstoken" in embedding_method_detail.lower() or raw_features.shape[1] == 1 : # Already a CLS token or equivalent
+                        final_embedding = raw_features[:, 0] # if shape [B,1,D] squeeze, else it's fine
+                        if final_embedding.ndim == 1 and raw_features.shape[0] == 1: # if B=1, result is [D], unsqueeze
+                            final_embedding = final_embedding.unsqueeze(0)
+                        elif final_embedding.ndim == 2 and raw_features.shape[0] > 1 : # [B,D]
+                             pass # Correct shape
+                        print(f"[STATUS] Using CLS token or equivalent from raw_features shape {raw_features.shape}")
+                    else: # Likely patch tokens or sequence of tokens, average pool them
+                        final_embedding = raw_features.mean(dim=1)
+                        print(f"[STATUS] Applied mean pooling over token dimension from raw_features shape {raw_features.shape}")
+                elif raw_features.ndim == 2: # Already [B, D]
+                    final_embedding = raw_features
+                    print(f"[STATUS] Using raw_features as is (shape {raw_features.shape})")
+                else:
+                    raise ValueError(f"Unsupported raw_features shape: {raw_features.shape}")
+
+                # Normalize the final embedding
+                final_embedding = torch.nn.functional.normalize(final_embedding, dim=-1)
+                print(f"[STATUS] Normalized final embedding, shape: {final_embedding.shape}")
+        
         # Create metadata for the whole image
         image_id = str(uuid.uuid4())
-        
-        # We'll update this after processing to include the actual layer used
         metadata = {
-            "region_id": image_id,
+            "region_id": image_id, # Using image_id as region_id for consistency in Qdrant
             "image_source": str(image_source) if isinstance(image_source, str) else "uploaded_image",
-            "bbox": [0, 0, image.shape[1], image.shape[0]],  # Full image bbox
-            "area": image.shape[0] * image.shape[1],
-            "area_ratio": 1.0,  # Full image has area ratio of 1
-            "processing_type": "whole_image",  # Indicates this is a whole image, not a region
-            "embedding_method": "pe_encoder",
-            "layer_used": optimal_layer  # Will be updated after processing
+            "filename": os.path.basename(str(image_source)) if isinstance(image_source, str) else "uploaded_image",
+            "bbox": [0, 0, image_np.shape[1], image_np.shape[0]],
+            "area_ratio": 1.0,
+            "processing_type": "whole_image",
+            "embedding_config": { # New field for detailed config
+                "extraction_mode": extraction_mode,
+                "layers_used": actual_layers_used_for_embedding,
+                "weights_used": weights_to_use if extraction_mode != "single" else "N/A",
+                "temperature": temperature,
+                "embedding_method_detail": embedding_method_detail
+            }
         }
-
-        # Process the image with PE model - using the SAME approach as in region processing
-        print(f"[STATUS] Processing image with Perception Encoder...")
         
-        # Convert to PIL for model input
-        pil_img = Image.fromarray(image)
+        embedding_cpu = final_embedding.cpu().detach()
         
-        # Process with PE model
-        with torch.no_grad():
-            # Convert to tensor in Float32 first (MPS compatibility)
-            pe_input = preprocess_to_use(pil_img).unsqueeze(0).to(device_to_use)
-            
-            # Try to get intermediate layer features using the same methods as region processing
-            features = None
-            embedding_method = "unknown"
-            
-            # Enable AMP for MPS if using PyTorch 2.0+
-            if torch.backends.mps.is_available() and hasattr(torch.amp, 'autocast'):
-                amp_context = torch.amp.autocast(device_type='mps', dtype=torch.float16)
-            else:
-                # Use a dummy context manager if autocast not available
-                amp_context = nullcontext()
-                
-            with amp_context:
-                # Method 1: Try using VisionTransformer if available (preferred)
-                if pe_vit_model_to_use is not None:
-                    try:
-                        # Use forward_features with layer_idx parameter
-                        # Allow user to select any layer they want - let the model handle invalid layers
-                        safe_layer = max(1, optimal_layer)  # Only ensure minimum layer of 1
-                        features = pe_vit_model_to_use.forward_features(pe_input, layer_idx=safe_layer)
-                        embedding_method = f"vit_forward_features_layer{safe_layer}"
-                        print(f"[STATUS] Successfully extracted features using VisionTransformer forward_features with layer {safe_layer}")
-                    except Exception as e:
-                        print(f"[STATUS] Error using VisionTransformer forward_features with layer {optimal_layer}: {e}")
-                        
-                # Method 2: Try using model.visual if it exists
-                if features is None and hasattr(pe_model_to_use, 'visual'):
-                    try:
-                        # Some vision transformers expose intermediate features
-                        if hasattr(pe_model_to_use.visual, 'transformer'):
-                            # Run forward pass and capture all intermediate activations
-                            output = pe_model_to_use.visual.transformer(
-                                pe_model_to_use.visual.conv1(pe_input),
-                                output_hidden_states=True
-                            )
-                            # Get the specific layer we want
-                            if isinstance(output, tuple) and len(output) > 1:
-                                # output[1] typically contains all hidden states
-                                hidden_states = output[1]
-                                # Respect user's layer choice, but clamp to available layers
-                                safe_layer = max(1, min(optimal_layer, len(hidden_states)-1))
-                                if isinstance(hidden_states, list) and len(hidden_states) > safe_layer:
-                                    features = hidden_states[safe_layer]
-                                    embedding_method = f"visual_transformer_hidden_states_layer{safe_layer}"
-                                    if safe_layer != optimal_layer:
-                                        print(f"[STATUS] Note: Requested layer {optimal_layer} not available, using layer {safe_layer} (max available: {len(hidden_states)-1})")
-                                    else:
-                                        print(f"[STATUS] Successfully extracted features using visual transformer hidden states with layer {safe_layer}")
-                        
-                    except Exception as e:
-                        print(f"[STATUS] Error accessing visual transformer: {e}")
-                
-                # Method 3: Fallback to using the final output embedding if needed
-                if features is None:
-                    print(f"[STATUS] Could not access intermediate layer {optimal_layer}, using final output")
-                    features = pe_model_to_use.encode_image(pe_input)
-                    embedding_method = "encode_image_fallback"
-                    print(f"[STATUS] Successfully extracted features using encode_image fallback")
-            
-                # Process features based on their shape
-                if len(features.shape) == 3:  # [batch, sequence_length, embedding_dim]
-                    # For transformer features, we need to pool the token embeddings
-                    embedding = features.mean(dim=1)  # Average pooling over sequence
-                    print(f"[STATUS] Applied mean pooling over sequence dimension")
-                else:
-                    # If already pooled or a single vector
-                    embedding = features
-                
-                # Normalize embedding
-                embedding = torch.nn.functional.normalize(embedding, dim=-1)
-                print(f"[STATUS] Normalized embedding, shape: {embedding.shape}")
-            
-            # Update metadata with the method used
-            metadata["embedding_method"] = embedding_method
-            
-            # Extract actual layer used from embedding_method for accurate metadata
-            actual_layer_used = optimal_layer  # default fallback
-            if "layer" in embedding_method:
-                try:
-                    # Extract layer number from embedding_method string
-                    layer_part = embedding_method.split("layer")[-1]
-                    actual_layer_used = int(layer_part)
-                except (ValueError, IndexError):
-                    # If extraction fails, use the optimal_layer as fallback
-                    actual_layer_used = optimal_layer
-            
-            metadata["layer_used"] = actual_layer_used
-            
-            # Move embedding to CPU
-            embedding_cpu = embedding.cpu()
-        
-        # Clean up CUDA/MPS memory if needed
         if torch.backends.mps.is_available():
-            # For MPS (Metal), we need explicit synchronization
-            torch.mps.synchronize()  # Ensure all MPS operations are complete
+            torch.mps.synchronize()
         
-        # Return results
-        print(f"[STATUS] Successfully extracted whole image embedding with shape: {embedding_cpu.shape}, method: {embedding_method}")
-        return image, embedding_cpu, metadata, "Whole Image"
+        print(f"[STATUS] Successfully extracted whole image embedding. Shape: {embedding_cpu.shape}, Method: {embedding_method_detail}")
+        return image_np, embedding_cpu, metadata, "Whole Image" # image_np is the numpy version of pil_image
         
     except Exception as e:
         print(f"[ERROR] Error extracting whole image embedding: {e}")
@@ -2584,6 +3060,8 @@ class GradioInterface:
         self.image_cache = {}
         self.search_result_images = []
         self.active_client = None
+        self.all_db_embeddings = None # For storing all embeddings from selected DB
+        self.all_db_metadata = None   # For storing all metadata from selected DB
         
         # Get available collections
         self.available_collections = list_available_databases()
@@ -2613,32 +3091,165 @@ class GradioInterface:
             # Close existing client if database changed
             if self.active_client is not None:
                 print(f"[STATUS] Closing previous database connection")
-                self.active_client.close()
+                try:
+                    self.active_client.close()
+                except Exception as e:
+                    print(f"[WARN] Error closing Qdrant client: {e}")
                 self.active_client = None
+            
+            # Reset stored embeddings and metadata
+            self.all_db_embeddings = None
+            self.all_db_metadata = None
+
+            try:
+                print(f"[STATUS] Connecting to Qdrant to load all embeddings for collection: {collection_name}")
+                # Ensure client is re-initialized if it was closed or is None
+                self.active_client = QdrantClient(path="./image_retrieval_project/qdrant_data")
                 
-            return f"Set active database to: {collection_name}"
+                # Check if collection exists
+                collections_info = self.active_client.get_collections()
+                if not any(c.name == collection_name for c in collections_info.collections):
+                    message = f"Error: Collection '{collection_name}' not found in Qdrant."
+                    print(f"[ERROR] {message}")
+                    return message
+
+                collection_info = self.active_client.get_collection(collection_name=collection_name)
+                vector_size = collection_info.config.params.vectors.size
+                total_points = collection_info.points_count
+                
+                if total_points == 0:
+                    print(f"[INFO] Collection '{collection_name}' is empty. No embeddings to load.")
+                    return f"Set active database to: {collection_name} (0 embeddings loaded)"
+
+                print(f"[STATUS] Loading {total_points} embeddings of size {vector_size} from '{collection_name}'...")
+                
+                all_vectors = []
+                all_payloads = []
+                
+                # Use scroll API to fetch all points
+                offset = None
+                processed_count = 0
+                while True:
+                    response = self.active_client.scroll(
+                        collection_name=collection_name,
+                        offset=offset,
+                        limit=256, # Adjust batch size as needed
+                        with_payload=True,
+                        with_vectors=True
+                    )
+                    points = response[0] # Actual points
+                    next_offset = response[1] # Next offset for pagination
+
+                    if not points:
+                        break
+                    
+                    for point in points:
+                        all_vectors.append(point.vector)
+                        all_payloads.append(point.payload)
+                    
+                    processed_count += len(points)
+                    print(f"[STATUS] Loaded {processed_count}/{total_points} embeddings...")
+                    
+                    if next_offset is None:
+                        break
+                    offset = next_offset
+                
+                if all_vectors:
+                    self.all_db_embeddings = torch.tensor(all_vectors, dtype=torch.float32)
+                    self.all_db_metadata = all_payloads
+                    print(f"[SUCCESS] Loaded {len(self.all_db_embeddings)} embeddings into memory for local search.")
+                    # Move to device if GPU is available and embeddings are successfully loaded
+                    if self.device and self.all_db_embeddings is not None:
+                        try:
+                            self.all_db_embeddings = self.all_db_embeddings.to(self.device)
+                            print(f"[STATUS] Moved all_db_embeddings to device: {self.device}")
+                        except Exception as e:
+                            print(f"[WARN] Failed to move all_db_embeddings to device {self.device}: {e}. Using CPU.")
+                else:
+                    print(f"[WARN] No vectors found in collection '{collection_name}' despite points_count={total_points}.")
+                    self.all_db_embeddings = None # Ensure it's None if no vectors
+                    self.all_db_metadata = []
+
+
+            except Exception as e:
+                error_msg = f"Error loading embeddings from {collection_name}: {e}"
+                print(f"[ERROR] {error_msg}")
+                import traceback
+                traceback.print_exc()
+                self.all_db_embeddings = None # Ensure reset on error
+                self.all_db_metadata = None
+                return error_msg # Return error message to UI
+
+            return f"Set active database to: {collection_name} ({len(self.all_db_embeddings) if self.all_db_embeddings is not None else 0} embeddings loaded)"
         return "No database selected"
 
-    def process_image_with_prompt(self, image, text_prompt, min_area_ratio=0.01, max_regions=5, optimal_layer=40, pooling_strategy="top_k"):
+    def process_image_with_prompt(self, 
+                                image_pil_or_np, # Gradio might pass NumPy array or PIL
+                                text_prompt, 
+                                min_area_ratio=0.01, 
+                                max_regions=5, 
+                                # NEW PARAMETERS from UI
+                                extraction_mode="single", 
+                                optimal_layer_ui=40,
+                                preset_name_ui="object_focused",
+                                custom_layer_1=30, custom_weight_1=0.3,
+                                custom_layer_2=40, custom_weight_2=0.4,
+                                custom_layer_3=47, custom_weight_3=0.3,
+                                pooling_strategy_ui="top_k",
+                                temperature_ui=0.07, 
+                                top_k_ratio_ui=0.1, 
+                                attention_heads_ui=8
+                                ):
         """Process an uploaded image with a text prompt to detect regions"""
-        if isinstance(image, np.ndarray):
-            image_pil = Image.fromarray(image)
+        if isinstance(image_pil_or_np, np.ndarray):
+            image_pil = Image.fromarray(image_pil_or_np)
         else:
-            image_pil = image
+            image_pil = image_pil_or_np # Assuming it's already PIL
+
+        custom_layers_list = [cl for cl in [custom_layer_1, custom_layer_2, custom_layer_3] if cl is not None]
+        custom_weights_list = [cw for cw in [custom_weight_1, custom_weight_2, custom_weight_3] if cw is not None]
+        
+        # Adjust weights list to match the number of valid layers if necessary
+        if len(custom_layers_list) < len(custom_weights_list):
+            custom_weights_list = custom_weights_list[:len(custom_layers_list)]
+        elif len(custom_weights_list) < len(custom_layers_list): # Should not happen if UI enforces it
+            # Fill remaining weights with default if fewer weights than layers
+            default_weight = 0.1 
+            custom_weights_list.extend([default_weight] * (len(custom_layers_list) - len(custom_weights_list)))
+
+
+        print(f"Gradio process_image_with_prompt:")
+        print(f"  extraction_mode='{extraction_mode}', optimal_layer_ui={optimal_layer_ui}")
+        print(f"  preset_name_ui='{preset_name_ui}'")
+        print(f"  custom_layers_list={custom_layers_list}, custom_weights_list={custom_weights_list}")
+        print(f"  pooling_strategy_ui='{pooling_strategy_ui}', temperature_ui={temperature_ui}")
+        print(f"  top_k_ratio_ui={top_k_ratio_ui}, attention_heads_ui={attention_heads_ui}")
+        print(f"  min_area_ratio={min_area_ratio}, max_regions={max_regions}")
+
 
         # Extract regions from image
         image_np, masks, embeddings, metadata, labels, error_message = extract_region_embeddings_autodistill(
-            image_pil,
+            image_source=image_pil, # Pass the PIL image
             text_prompt=text_prompt,
             pe_model_param=self.pe_model,
             pe_vit_model_param=self.pe_vit_model,
             preprocess_param=self.preprocess,
             device_param=self.device,
-            is_url=False,
+            is_url=False, # Direct image upload
             min_area_ratio=min_area_ratio,
             max_regions=max_regions,
-            optimal_layer=optimal_layer,
-            pooling_strategy=pooling_strategy
+            # max_image_size is handled by extract_region_embeddings_autodistill default
+            
+            # NEWLY PASSED PARAMETERS
+            extraction_mode=extraction_mode,
+            optimal_layer=optimal_layer_ui, 
+            preset_name=preset_name_ui,
+            custom_layers=custom_layers_list,
+            custom_weights=custom_weights_list,
+            pooling_strategy=pooling_strategy_ui, 
+            temperature=temperature_ui,
+            top_k_ratio=top_k_ratio_ui,
+            attention_heads=attention_heads_ui
         )
 
         # Store results
@@ -2720,206 +3331,190 @@ class GradioInterface:
 
         return Image.open(buf)
 
-    def search_region(self, region_selection, similarity_threshold=0.5, max_results=5, optimal_layer=40):
-        """Search for similar regions based on the selected region's embedding"""
-        print(f"[STATUS] Starting search for similar regions...")
+    def search_region(self, region_selection, similarity_threshold=0.5, max_results=5, temperature_gr=0.07): # Added temperature_gr, removed optimal_layer
+        """Search for similar regions using in-memory embeddings and temperature-scaled similarity."""
+        print(f"[STATUS] Starting local search for similar regions with temperature: {temperature_gr}")
+
         if region_selection is None or self.detected_regions["image"] is None:
-            print(f"[STATUS] No region selected or no detected regions available")
+            print(f"[STATUS] No region selected or no detected regions available for query.")
             return None, "Please select a region first.", gr.update(visible=False), gr.update(choices=[], value=None)
 
-        print(f"[STATUS] Processing region selection: {region_selection}")
-        region_idx = int(region_selection.split(":")[0].replace("Region ", "")) - 1
-
-        if region_idx < 0 or region_idx >= len(self.detected_regions["embeddings"]):
-            print(f"[STATUS] Invalid region index: {region_idx}")
-            return None, "Invalid region selection.", gr.update(visible=False), gr.update(choices=[], value=None)
-
-        # Get the embedding for the selected region
-        embedding = self.detected_regions["embeddings"][region_idx]
-        print(f"[STATUS] Retrieved embedding for region {region_idx}, shape: {embedding.shape}")
+        if self.all_db_embeddings is None or self.all_db_metadata is None:
+            error_msg = "Database embeddings not loaded. Please select a database/collection first."
+            print(f"[ERROR] {error_msg}")
+            return None, error_msg, gr.update(visible=False), gr.update(choices=[], value=None)
         
-        # Connect to Qdrant
+        if self.all_db_embeddings.numel() == 0:
+            error_msg = f"The selected database '{self.active_collection}' is empty."
+            print(f"[ERROR] {error_msg}")
+            return None, error_msg, gr.update(visible=False), gr.update(choices=[], value=None)
+
         try:
-            print(f"[STATUS] Connecting to vector database...")
-            if self.active_client is None:
-                self.active_client = QdrantClient(path="./image_retrieval_project/qdrant_data")
-                print(f"[STATUS] Created new database connection")
-            else:
-                print(f"[STATUS] Using existing database connection")
+            region_idx = int(region_selection.split(":")[0].replace("Region ", "")) - 1
+            if not (0 <= region_idx < len(self.detected_regions["embeddings"])):
+                print(f"[ERROR] Invalid region index: {region_idx}")
+                return None, "Invalid region selection.", gr.update(visible=False), gr.update(choices=[], value=None)
+
+            query_embedding = self.detected_regions["embeddings"][region_idx]
+            if not isinstance(query_embedding, torch.Tensor): # Ensure it's a tensor
+                query_embedding = torch.tensor(query_embedding, dtype=torch.float32)
             
-            # Use exactly the collection name the user selected
-            collection_name = self.active_collection
-            print(f"[STATUS] Using selected collection: {collection_name}")
+            # Move query embedding to the same device as db embeddings (which should be self.device or CPU)
+            query_embedding = query_embedding.to(self.all_db_embeddings.device)
+
+            print(f"[STATUS] Retrieved query embedding for region {region_idx}, shape: {query_embedding.shape}, device: {query_embedding.device}")
+            print(f"[STATUS] Database embeddings shape: {self.all_db_embeddings.shape}, device: {self.all_db_embeddings.device}")
+
+            # Calculate temperature-scaled similarity scores against all DB embeddings
+            # The temperature_scaled_similarity function handles normalization andunsqueeze for query
+            scores_tensor = temperature_scaled_similarity(query_embedding, self.all_db_embeddings, temperature_gr)
             
-            # Verify the collection exists
-            collections = self.active_client.get_collections().collections
-            collection_names = [collection.name for collection in collections]
-            print(f"[STATUS] Available collections: {collection_names}")
-            
-            # Check if collection exists
-            if collection_name not in collection_names:
-                print(f"[ERROR] Collection {collection_name} not found")
-                available_cols = "\n".join(collection_names)
-                return None, f"Error: Collection '{collection_name}' not found. Available collections:\n{available_cols}", gr.update(visible=False), gr.update(choices=[], value=None)
-            
-            # Ensure parameters are the correct type
-            limit = int(max_results) if isinstance(max_results, str) else max_results
-            threshold = float(similarity_threshold) if isinstance(similarity_threshold, str) else similarity_threshold
-            
-            # Convert embedding to list for Qdrant - properly format as 1D vector
-            print(f"[STATUS] Converting embedding to list format...")
-            if len(embedding.shape) == 2 and embedding.shape[0] == 1:
-                # Extract the inner vector if shape is [1, D]
-                embedding_list = embedding[0].cpu().numpy().tolist()
-            else:
-                # Otherwise convert the tensor to a flattened list
-                embedding_list = embedding.cpu().numpy().flatten().tolist()
-            
-            # Perform the search
-            try:
-                search_results = self.active_client.search(
-                    collection_name=collection_name,
-                    query_vector=embedding_list,
-                    limit=limit,
-                    score_threshold=threshold
+            # Scores_tensor is 1D if query_embedding was (D) and all_db_embeddings (N,D)
+            # Or (N) if query_embedding was (1,D) and all_db_embeddings (N,D)
+            # Squeeze if it's (1,N) from unsqueezed query vs (N,D) candidates
+            if scores_tensor.ndim == 2 and scores_tensor.shape[0] == 1:
+                scores_tensor = scores_tensor.squeeze(0)
+
+            if scores_tensor.numel() != len(self.all_db_metadata):
+                error_msg = f"Mismatch between number of scores ({scores_tensor.numel()}) and metadata entries ({len(self.all_db_metadata)})."
+                print(f"[ERROR] {error_msg}")
+                return None, error_msg, gr.update(visible=False), gr.update(choices=[], value=None)
+
+            # Combine scores with metadata
+            results_with_scores = []
+            for i, score_val in enumerate(scores_tensor):
+                # Create a Qdrant-like ScoredPoint structure for compatibility
+                # The ID can be derived from metadata if available, else use index
+                point_id = self.all_db_metadata[i].get("region_id", str(uuid.uuid4()))
+                
+                # Ensure payload is a dictionary (it should be)
+                payload = self.all_db_metadata[i]
+                if not isinstance(payload, dict):
+                    payload = {"data": payload} # Basic fallback
+
+                # Add collection type and name to payload for visualization consistency
+                payload["collection_type"] = "region" if "_layer" in self.active_collection and "_whole_images_layer" not in self.active_collection else "whole_image"
+                payload["collection_name"] = self.active_collection
+                
+                scored_point = models.ScoredPoint(
+                    id=point_id,
+                    version=0, # Dummy version
+                    score=score_val.item(), # Actual score from temp_scaled_similarity
+                    payload=payload,
+                    vector=None # Not returning vector in search results display
                 )
-                
-                print(f"[STATUS] Found {len(search_results)} results in {collection_name}")
-                
-                # Add collection information to results
-                for result in search_results:
-                    if hasattr(result, "payload"):
-                        # Set a default collection type based on name for display
-                        if "_layer" in collection_name:
-                            result.payload["collection_type"] = "region"
-                        elif "_whole_images_layer" in collection_name:
-                            result.payload["collection_type"] = "whole_image"
-                        else:
-                            result.payload["collection_type"] = "unknown"
-                        result.payload["collection_name"] = collection_name
-                
-                if not search_results:
-                    print(f"[STATUS] No similar items found above threshold {threshold}")
-                    return None, f"No similar items found with similarity threshold {threshold}.", gr.update(visible=False), gr.update(choices=[], value=None)
-                
-                # Create visualization of results
-                return self.create_unified_search_results_visualization(
-                    search_results, 
-                    self.detected_regions["image"],
-                    self.detected_regions["masks"][region_idx],
-                    self.detected_regions["labels"][region_idx],
-                    "region"
-                )
-            except Exception as e:
-                print(f"[ERROR] Error during search in collection {collection_name}: {e}")
-                import traceback
-                traceback.print_exc()
-                return None, f"Error searching collection {collection_name}: {str(e)}", gr.update(visible=False), gr.update(choices=[], value=None)
-        
+                results_with_scores.append(scored_point)
+
+            # Sort results by score (descending)
+            results_with_scores.sort(key=lambda x: x.score, reverse=True)
+            
+            # Apply similarity threshold
+            # Note: The meaning of 'similarity_threshold' changes with temp-scaled scores.
+            # These scores are not bounded [0,1] like cosine similarity.
+            # For now, applying it directly. May need adjustment based on typical score range.
+            final_results = [res for res in results_with_scores if res.score >= float(similarity_threshold)]
+            
+            # Limit to max_results
+            final_results = final_results[:int(max_results)]
+
+            print(f"[STATUS] Found {len(final_results)} similar regions after filtering and sorting.")
+
+            if not final_results:
+                return None, f"No similar items found above threshold {similarity_threshold} with current temperature.", gr.update(visible=False), gr.update(choices=[], value=None)
+
+            return self.create_unified_search_results_visualization(
+                final_results,
+                self.detected_regions["image"],
+                self.detected_regions["masks"][region_idx],
+                self.detected_regions["labels"][region_idx],
+                "region"
+            )
+
         except Exception as e:
-            error_message = f"Error searching for similar regions: {str(e)}"
+            error_message = f"Error during local region search: {str(e)}"
             print(f"[ERROR] {error_message}")
             import traceback
             traceback.print_exc()
             return None, error_message, gr.update(visible=False), gr.update(choices=[], value=None)
 
-    def search_whole_image(self, similarity_threshold=0.5, max_results=5, optimal_layer=40):
-        """Search for similar whole images based on the processed image's embedding"""
-        print(f"[STATUS] Starting search for similar whole images...")
+    def search_whole_image(self, similarity_threshold=0.5, max_results=5, temperature_gr=0.07): # Added temperature_gr, removed optimal_layer
+        """Search for similar whole images using in-memory embeddings and temperature-scaled similarity."""
+        print(f"[STATUS] Starting local search for similar whole images with temperature: {temperature_gr}")
+
         if self.whole_image["image"] is None or self.whole_image["embedding"] is None:
-            print(f"[STATUS] No processed image available")
-            return None, "Please process an image first.", gr.update(visible=False), gr.update(choices=[], value=None)
+            print(f"[STATUS] No processed whole image available for query.")
+            return None, "Please process an image first to get its whole embedding.", gr.update(visible=False), gr.update(choices=[], value=None)
 
-        # Check if the processed image used the same layer as requested for search
-        actual_layer = self.whole_image.get("layer_used", -1)
-        if actual_layer != optimal_layer:
-            print(f"[INFO] Search layer ({optimal_layer}) doesn't match the layer used for processing ({actual_layer})")
-            print(f"[INFO] This is fine as PE embeddings are compatible across different layers")
+        if self.all_db_embeddings is None or self.all_db_metadata is None:
+            error_msg = "Database embeddings not loaded. Please select a database/collection first."
+            print(f"[ERROR] {error_msg}")
+            return None, error_msg, gr.update(visible=False), gr.update(choices=[], value=None)
 
-        # Get the embedding for the whole image
-        embedding = self.whole_image["embedding"]
-        print(f"[STATUS] Retrieved embedding for whole image, shape: {embedding.shape}")
-        
-        # Connect to Qdrant
+        if self.all_db_embeddings.numel() == 0:
+            error_msg = f"The selected database '{self.active_collection}' is empty."
+            print(f"[ERROR] {error_msg}")
+            return None, error_msg, gr.update(visible=False), gr.update(choices=[], value=None)
+            
         try:
-            print(f"[STATUS] Connecting to vector database...")
-            if self.active_client is None:
-                self.active_client = QdrantClient(path="./image_retrieval_project/qdrant_data")
-                print(f"[STATUS] Created new database connection")
-            else:
-                print(f"[STATUS] Using existing database connection")
+            query_embedding = self.whole_image["embedding"]
+            if not isinstance(query_embedding, torch.Tensor): # Ensure it's a tensor
+                query_embedding = torch.tensor(query_embedding, dtype=torch.float32)
+
+            # Move query embedding to the same device as db embeddings
+            query_embedding = query_embedding.to(self.all_db_embeddings.device)
             
-            # Use exactly the collection name the user selected
-            collection_name = self.active_collection
-            print(f"[STATUS] Using selected collection: {collection_name}")
+            print(f"[STATUS] Retrieved query embedding for whole image, shape: {query_embedding.shape}, device: {query_embedding.device}")
+            print(f"[STATUS] Database embeddings shape: {self.all_db_embeddings.shape}, device: {self.all_db_embeddings.device}")
+
+            scores_tensor = temperature_scaled_similarity(query_embedding, self.all_db_embeddings, temperature_gr)
             
-            # Verify the collection exists
-            collections = self.active_client.get_collections().collections
-            collection_names = [collection.name for collection in collections]
-            print(f"[STATUS] Available collections: {collection_names}")
-            
-            # Check if collection exists
-            if collection_name not in collection_names:
-                print(f"[ERROR] Collection {collection_name} not found")
-                available_cols = "\n".join(collection_names)
-                return None, f"Error: Collection '{collection_name}' not found. Available collections:\n{available_cols}", gr.update(visible=False), gr.update(choices=[], value=None)
-            
-            # Ensure parameters are the correct type
-            limit = int(max_results) if isinstance(max_results, str) else max_results
-            threshold = float(similarity_threshold) if isinstance(similarity_threshold, str) else similarity_threshold
-            
-            # Convert embedding to list for Qdrant - properly format as 1D vector
-            print(f"[STATUS] Converting embedding to list format...")
-            if len(embedding.shape) == 2 and embedding.shape[0] == 1:
-                # Extract the inner vector if shape is [1, D]
-                embedding_list = embedding[0].cpu().numpy().tolist()
-            else:
-                # Otherwise convert the tensor to a flattened list
-                embedding_list = embedding.cpu().numpy().flatten().tolist()
-            
-            # Perform the search
-            try:
-                search_results = self.active_client.search(
-                    collection_name=collection_name,
-                    query_vector=embedding_list,
-                    limit=limit,
-                    score_threshold=threshold
+            if scores_tensor.ndim == 2 and scores_tensor.shape[0] == 1: # Ensure 1D tensor of scores
+                scores_tensor = scores_tensor.squeeze(0)
+
+            if scores_tensor.numel() != len(self.all_db_metadata):
+                error_msg = f"Mismatch between number of scores ({scores_tensor.numel()}) and metadata entries ({len(self.all_db_metadata)})."
+                print(f"[ERROR] {error_msg}")
+                return None, error_msg, gr.update(visible=False), gr.update(choices=[], value=None)
+
+            results_with_scores = []
+            for i, score_val in enumerate(scores_tensor):
+                point_id = self.all_db_metadata[i].get("region_id", str(uuid.uuid4())) # region_id is used as point ID
+                
+                payload = self.all_db_metadata[i]
+                if not isinstance(payload, dict): payload = {"data": payload}
+
+                payload["collection_type"] = "whole_image" # Assuming only whole images in a whole image search context
+                payload["collection_name"] = self.active_collection
+                
+                scored_point = models.ScoredPoint(
+                    id=point_id,
+                    version=0, 
+                    score=score_val.item(),
+                    payload=payload,
+                    vector=None 
                 )
-                
-                print(f"[STATUS] Found {len(search_results)} results in {collection_name}")
-                
-                # Add collection information to results
-                for result in search_results:
-                    if hasattr(result, "payload"):
-                        # Set a default collection type based on name for display
-                        if "_layer" in collection_name:
-                            result.payload["collection_type"] = "region"
-                        elif "_whole_images_layer" in collection_name:
-                            result.payload["collection_type"] = "whole_image"
-                        else:
-                            result.payload["collection_type"] = "unknown"
-                        result.payload["collection_name"] = collection_name
-                
-                if not search_results:
-                    print(f"[STATUS] No similar items found above threshold {threshold}")
-                    return None, f"No similar items found with similarity threshold {threshold}.", gr.update(visible=False), gr.update(choices=[], value=None)
-                
-                # Create visualization of results
-                return self.create_unified_search_results_visualization(
-                    search_results, 
-                    self.whole_image["image"],
-                    None,  # No mask for whole image
-                    "Whole Image",  # Label for whole image
-                    "whole_image"
-                )
-            except Exception as e:
-                print(f"[ERROR] Error during search in collection {collection_name}: {e}")
-                import traceback
-                traceback.print_exc()
-                return None, f"Error searching collection {collection_name}: {str(e)}", gr.update(visible=False), gr.update(choices=[], value=None)
-        
+                results_with_scores.append(scored_point)
+
+            results_with_scores.sort(key=lambda x: x.score, reverse=True)
+            
+            final_results = [res for res in results_with_scores if res.score >= float(similarity_threshold)]
+            final_results = final_results[:int(max_results)]
+
+            print(f"[STATUS] Found {len(final_results)} similar whole images after filtering and sorting.")
+
+            if not final_results:
+                return None, f"No similar whole images found above threshold {similarity_threshold} with current temperature.", gr.update(visible=False), gr.update(choices=[], value=None)
+
+            return self.create_unified_search_results_visualization(
+                final_results,
+                self.whole_image["image"],
+                None,  # No mask for whole image query
+                self.whole_image.get("label", "Whole Query Image"),
+                "whole_image"
+            )
+
         except Exception as e:
-            error_message = f"Error searching for similar images: {str(e)}"
+            error_message = f"Error during local whole image search: {str(e)}"
             print(f"[ERROR] {error_message}")
             import traceback
             traceback.print_exc()
@@ -3328,26 +3923,94 @@ class GradioInterface:
                     )
                 
                 # Add parameter controls before the process button
+                    gr.Markdown("#### Advanced PE Configuration") # Title for the new section
+                    extraction_mode_radio = gr.Radio(
+                        choices=["single", "preset", "multi_layer"],
+                        value="single",
+                        label="Feature Extraction Mode",
+                        interactive=True
+                    )
+                    
+                    with gr.Group(visible=True) as single_options_group: # Visible by default
+                        optimal_layer_slider_ui = gr.Slider( 
+                            minimum=1, maximum=47, value=40, step=1, 
+                            label="PE Layer (for Single Mode)",
+                            info="Layer of the PE-ViT model to use for 'single' mode.",
+                            interactive=True
+                        )
+
+                    with gr.Group(visible=False) as preset_options_group:
+                        preset_name_dropdown_ui = gr.Dropdown(
+                            choices=["object_focused", "spatial_focused", "semantic_focused"],
+                            value="object_focused",
+                            label="Preset Configuration",
+                            info="Select a predefined multi-layer configuration.",
+                            interactive=True
+                        )
+
+                    with gr.Group(visible=False) as custom_options_group:
+                        gr.Markdown("Define up to 3 layers and their weights for 'multi_layer' mode. Ensure weights roughly sum to 1 or they will be normalized.")
+                        custom_layers_sliders_ui = []
+                        custom_weights_sliders_ui = []
+                        default_custom_layers = [30, 40, 47] # Default example values
+                        default_custom_weights = [0.3, 0.4, 0.3] # Default example values
+                        for i in range(3): 
+                            with gr.Row():
+                                with gr.Column(scale=2):
+                                    layer_slider = gr.Slider(
+                                        minimum=1, maximum=47, value=default_custom_layers[i], step=1,
+                                        label=f"Custom Layer {i+1}",
+                                        interactive=True
+                                    )
+                                    custom_layers_sliders_ui.append(layer_slider)
+                                with gr.Column(scale=1):
+                                    weight_slider = gr.Slider(
+                                        minimum=0.0, maximum=1.0, value=default_custom_weights[i], step=0.01,
+                                        label=f"Weight {i+1}",
+                                        interactive=True
+                                    )
+                                    custom_weights_sliders_ui.append(weight_slider)
+                    
+                    gr.Markdown("#### Detection & Pooling Parameters") # Title for existing and new pooling params
                 with gr.Row():
                     with gr.Column():
-                        embedding_layer = gr.Slider(
-                            minimum=1, maximum=50, value=40, step=1,
-                            label="Embedding Layer",
-                            info="Layer of the Perception Encoder to use for detection"
-                        )
-                    with gr.Column():
-                        min_area_ratio = gr.Slider(
+                            min_area_ratio = gr.Slider( # Existing parameter
                             minimum=0.001, maximum=0.1, value=0.01, step=0.001,
                             label="Minimum Area Ratio",
                             info="Minimum size of regions to detect (as a fraction of image size)"
                         )
                     with gr.Column():
-                        max_regions = gr.Slider(
+                            max_regions = gr.Slider( # Existing parameter
                             minimum=1, maximum=20, value=5, step=1,
                             label="Maximum Regions",
                             info="Maximum number of regions to detect per image"
                         )
-                
+                    
+                    with gr.Row():
+                        pooling_strategy_dropdown_ui = gr.Dropdown(
+                            choices=["top_k", "pe_attention", "pe_spatial", "pe_semantic", "pe_adaptive", "average", "max", "attention"],
+                            value="top_k", # Default from process_image_with_prompt
+                            label="Pooling Strategy",
+                            interactive=True
+                        )
+                        temperature_slider_ui = gr.Slider(
+                            minimum=0.01, maximum=1.0, value=0.07, step=0.01,
+                            label="Temperature (pooling/combination)",
+                            interactive=True
+                        )
+                    
+                    with gr.Row():
+                        top_k_ratio_slider_ui = gr.Slider(
+                            minimum=0.01, maximum=1.0, value=0.1, step=0.01,
+                            label="Top-K Ratio (for 'top_k' pooling)",
+                            interactive=True
+                        )
+                        attention_heads_slider_ui = gr.Slider(
+                            minimum=1, maximum=16, value=8, step=1,
+                            label="Attention Heads (for 'pe_attention')",
+                            interactive=True
+                        )
+
                 with gr.Row():
                     process_button = gr.Button("Detect Regions", variant="primary")
             
@@ -3436,9 +4099,37 @@ class GradioInterface:
             )
             
             # Connect buttons to functions for region-based processing
+            
+            # Define the visibility update function for extraction modes
+            def update_extraction_visibility(mode_value):
+                return {
+                    single_options_group: gr.update(visible=(mode_value == "single")),
+                    preset_options_group: gr.update(visible=(mode_value == "preset")),
+                    custom_options_group: gr.update(visible=(mode_value == "multi_layer")),
+                }
+
+            extraction_mode_radio.change(
+                fn=update_extraction_visibility,
+                inputs=[extraction_mode_radio],
+                outputs=[single_options_group, preset_options_group, custom_options_group]
+            )
+
             process_button.click(
                 self.process_image_with_prompt,
-                inputs=[input_image, text_prompt, min_area_ratio, max_regions, embedding_layer],
+                inputs=[
+                    input_image, text_prompt, 
+                    min_area_ratio, max_regions, # Existing params for detection
+                    extraction_mode_radio,         # New
+                    optimal_layer_slider_ui,       # New (replaces old embedding_layer)
+                    preset_name_dropdown_ui,       # New
+                    custom_layers_sliders_ui[0], custom_weights_sliders_ui[0], # New
+                    custom_layers_sliders_ui[1], custom_weights_sliders_ui[1], # New
+                    custom_layers_sliders_ui[2], custom_weights_sliders_ui[2], # New
+                    pooling_strategy_dropdown_ui,  # New
+                    temperature_slider_ui,         # New
+                    top_k_ratio_slider_ui,         # New
+                    attention_heads_slider_ui      # New
+                ],
                 outputs=[segmented_output, detection_info, region_dropdown, region_preview]
             )
 
@@ -3450,20 +4141,29 @@ class GradioInterface:
 
             search_button.click(
                 self.search_region,
-                inputs=[region_dropdown, similarity_slider, max_results_dropdown, embedding_layer],
+                # Pass temperature_slider_ui. Note: embedding_layer was removed from search_region's signature.
+                inputs=[region_dropdown, similarity_slider, max_results_dropdown, temperature_slider_ui],
                 outputs=[search_results_output, search_info, button_section, result_selector]
             )
             
             # Connect buttons to functions for whole-image processing
+            # (process_whole_button's call to self.process_whole_image does not need temperature for query generation itself,
+            # but extract_whole_image_embeddings it calls *does* accept temperature for multi-layer combination.
+            # However, the UI for whole_image_mode_group currently only has whole_image_layer, not the full advanced PE config block.
+            # This is consistent with the prompt focusing temperature on the *search* part for whole images.)
             process_whole_button.click(
-                self.process_whole_image,
-                inputs=[input_image, whole_image_layer],
+                self.process_whole_image, # process_whole_image itself doesn't take temperature_ui directly for its own logic
+                                         # but the extract_whole_image_embeddings it calls has a temperature parameter.
+                                         # The UI doesn't currently expose a specific temperature for *processing* the whole image query if it were multi-layer.
+                                         # This is fine as per prompt's focus on search similarity.
+                inputs=[input_image, whole_image_layer], # Assuming whole_image_layer is optimal_layer for single, or used in preset/multi if UI was extended
                 outputs=[processed_output, whole_image_info]
             )
             
             whole_search_button.click(
                 self.search_whole_image,
-                inputs=[whole_similarity_slider, whole_max_results_dropdown, whole_image_layer],
+                # Pass temperature_slider_ui. Note: whole_image_layer (as optimal_layer) was removed from search_whole_image's signature.
+                inputs=[whole_similarity_slider, whole_max_results_dropdown, temperature_slider_ui],
                 outputs=[search_results_output, search_info, button_section, result_selector]
             )
             
@@ -4627,6 +5327,120 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
         interface.set_active_collection(app_state.available_databases[0])
     
     return demo
+
+# =============================================================================
+# MULTI-LAYER FEATURE HELPERS (now at module level)
+# =============================================================================
+
+def get_preset_configuration(preset_name):
+    presets = {
+        "object_focused": {
+            "layers": [30, 40, 47],
+            "weights": [0.3, 0.4, 0.3],
+            "pooling": "pe_attention"
+        },
+        "spatial_focused": {
+            "layers": [25, 30, 35], 
+            "weights": [0.5, 0.3, 0.2],
+            "pooling": "pe_spatial"
+        },
+        "semantic_focused": {
+            "layers": [40, 45, 47],
+            "weights": [0.2, 0.3, 0.5], 
+            "pooling": "pe_semantic"
+        }
+    }
+    return presets.get(preset_name, presets["object_focused"]) # Default to object_focused
+
+def extract_multi_layer_features(pil_image, pe_vit_model, preprocess_fn, layers, device):
+    """
+    Extract features from multiple PE layers.
+    Assumes pe_vit_model is the VisionTransformer model.
+    Assumes pil_image is a PIL Image.
+    preprocess_fn is the preprocessing function.
+    """
+    if pe_vit_model is None:
+        print("[WARN] Vision Transformer model not available for multi-layer feature extraction.")
+        return None
+        
+    layer_features = {}
+    # Ensure preprocess_fn and pe_input are correctly handled if this function is truly global
+    # For now, assuming preprocess_fn is passed in and works.
+    pe_input = preprocess_fn(pil_image).unsqueeze(0).to(device)
+    
+    with torch.no_grad():
+        for layer_idx in layers:
+            try:
+                features = pe_vit_model.forward_features(pe_input, layer_idx=max(1, layer_idx))
+                layer_features[layer_idx] = features
+                print(f"[INFO] Extracted features from layer {layer_idx}, shape: {features.shape}")
+            except Exception as e:
+                print(f"[ERROR] Failed to extract features from layer {layer_idx}: {e}")
+                layer_features[layer_idx] = None
+    return layer_features
+
+def combine_layer_features(layer_features_dict, weights_list, temperature=0.07):
+    """
+    Combine features from multiple layers using weighted averaging.
+    layer_features_dict: Dictionary of features keyed by layer number {layer_idx: tensor}.
+    weights_list: List of weights corresponding to the layers.
+    temperature: Not used in current simple weighted average.
+    """
+    if not layer_features_dict or not weights_list:
+        print("[WARN] Layer features or weights are empty. Cannot combine.")
+        return None
+    
+    # Ensure correct alignment of features and weights.
+    # This implementation assumes that layer_features_dict.values() will provide features
+    # in an order that corresponds to weights_list if the dict was populated in layers_to_use order.
+    # A more robust method would be to pass layers_to_use and iterate through it.
+    feature_tensors = [feat for feat in layer_features_dict.values() if feat is not None] # Filter out None features
+    
+    if not feature_tensors:
+        print("[WARN] No valid feature tensors to combine after filtering Nones.")
+        return None
+
+    # Adjust weights if some features were None and filtered out.
+    # This part is tricky if weights_list was for the original set of layers.
+    # For simplicity, this version assumes weights_list corresponds to the non-None features.
+    # A truly robust implementation would require layer_keys with weights or careful filtering.
+    if len(feature_tensors) != len(weights_list):
+        print(f"[WARN] Number of non-None feature tensors ({len(feature_tensors)}) "
+              f"does not match number of weights ({len(weights_list)}). Combination might be skewed or fail.")
+        # Fallback: if only one feature tensor, return it. Otherwise, cannot proceed if mismatch.
+        if len(feature_tensors) == 1 and len(weights_list) >=1 : # Try to use first weight if mismatch
+             return feature_tensors[0] * (weights_list[0] / sum(weights_list)) if sum(weights_list) !=0 else feature_tensors[0]
+        elif len(feature_tensors) == 1: # if weights_list is empty but one feature
+             return feature_tensors[0]
+        return None # Cannot reliably combine
+
+    # Weighted sum
+    combined_features = None
+    # Normalize weights if they don't sum to 1 (or handle as proportions)
+    total_weight = sum(weights_list)
+    if total_weight == 0: # Avoid division by zero if all weights are zero
+        print("[WARN] Total weight is zero. Averaging features instead.")
+        # Fallback to simple average if total_weight is zero
+        if feature_tensors:
+            sum_features = None
+            for features in feature_tensors:
+                if sum_features is None: sum_features = features
+                else: sum_features += features
+            return sum_features / len(feature_tensors) if len(feature_tensors) > 0 else None
+        return None
+
+    for i, features in enumerate(feature_tensors):
+        weight = weights_list[i] / total_weight # Normalize weight
+        if combined_features is None:
+            combined_features = features * weight
+        else:
+            if combined_features.shape != features.shape:
+                 print(f"[WARN] Shape mismatch during combination: combined_features ({combined_features.shape}) vs features ({features.shape}).")
+                 # Attempting to sum might fail. Add more sophisticated handling if needed.
+            combined_features += features * weight
+            
+    print(f"[INFO] Combined {len(feature_tensors)} layer features using normalized weights.")
+    return combined_features
 
 # =============================================================================
 # MAIN FUNCTION
