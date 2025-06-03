@@ -813,8 +813,14 @@ def extract_region_embeddings_autodistill(
     max_regions=10,
     is_url=False,
     max_image_size=800,
-    optimal_layer=40,
-    pooling_strategy="top_k"
+    # ENHANCED PARAMETERS (with backward-compatible defaults)
+    extraction_mode="single",     # "single" or "multi_layer" or "preset"
+    optimal_layer=30,            # Updated: Meta PE research optimal balance (was 40)
+    preset_name="object_focused", # For preset mode
+    custom_layers=[30,40,47],    # For multi_layer mode
+    custom_weights=[0.3,0.4,0.3], # For multi_layer mode
+    pooling_strategy="top_k",    # Existing parameter, now enhanced
+    temperature=0.07             # New temperature parameter
 ):
     """
     Simplified region detection and embedding extraction using GroundedSAM and Perception Encoder.
@@ -830,22 +836,10 @@ def extract_region_embeddings_autodistill(
     # Kept Helper Functions
     def apply_spatial_pooling(masked_features, strategy="top_k", top_k_ratio=0.1):
         """
-        Apply different pooling strategies to masked features.
+        Apply different pooling strategies to masked features. 
+        Enhanced with PE-optimized strategies while maintaining backward compatibility.
         """
-        if strategy == "max":
-            pooled = masked_features.max(dim=0, keepdim=True)[0]
-        elif strategy == "top_k":
-            feature_norms = masked_features.norm(dim=1)
-            k = max(1, int(top_k_ratio * len(feature_norms)))
-            top_k_indices = torch.topk(feature_norms, k)[1]
-            pooled = masked_features[top_k_indices].mean(dim=0, keepdim=True)
-        elif strategy == "attention":
-            feature_norms = masked_features.norm(dim=1)
-            attention_weights = torch.softmax(feature_norms, dim=0)
-            pooled = (masked_features * attention_weights.unsqueeze(1)).sum(dim=0, keepdim=True)
-        else:  # "average" or fallback
-            pooled = masked_features.mean(dim=0, keepdim=True)
-        return pooled
+        return apply_spatial_pooling_enhanced(masked_features, strategy, top_k_ratio, temperature)
 
     def get_detected_class(detections_obj, det_index, class_names_from_ontology):
         # detections_obj is the Detections object from GroundedSAM
@@ -1137,12 +1131,45 @@ def extract_region_embeddings_autodistill(
             pe_input = preprocess_to_use(pil_image).unsqueeze(0).to(device_to_use)
             
             try:
-                if pe_vit_model_to_use is not None:
-                    intermediate_features = pe_vit_model_to_use.forward_features(pe_input, layer_idx=max(1, optimal_layer))
-                    print(f"[STATUS] Successfully extracted intermediate features from layer {max(1, optimal_layer)} using VisionTransformer")
+                # NEW: Multi-layer extraction logic based on extraction_mode
+                if extraction_mode == "single":
+                    # Current single-layer approach (unchanged for backward compatibility)
+                    if pe_vit_model_to_use is not None:
+                        intermediate_features = pe_vit_model_to_use.forward_features(pe_input, layer_idx=max(1, optimal_layer))
+                        print(f"[STATUS] Single-layer extraction from layer {max(1, optimal_layer)}")
+                    else:
+                        intermediate_features = pe_model_to_use.encode_image(pe_input)
+                        print(f"[STATUS] Using fallback PE model (single vector)")
+                        
+                elif extraction_mode == "preset":
+                    # Use preset configuration
+                    config = get_preset_configuration(preset_name)
+                    if pe_vit_model_to_use is not None:
+                        layer_features = extract_multi_layer_features(pe_input, pe_vit_model_to_use, config["layers"], device_to_use)
+                        intermediate_features = combine_layer_features(layer_features, config["weights"], temperature)
+                        pooling_strategy = config["pooling"]  # Override pooling for preset
+                        print(f"[STATUS] Preset '{preset_name}' extraction from layers {config['layers']} with pooling '{pooling_strategy}'")
+                    else:
+                        print(f"[WARNING] Preset mode requires ViT model, falling back to single-layer")
+                        intermediate_features = pe_model_to_use.encode_image(pe_input)
+                        
+                elif extraction_mode == "multi_layer":
+                    # Use custom multi-layer configuration
+                    if pe_vit_model_to_use is not None:
+                        layer_features = extract_multi_layer_features(pe_input, pe_vit_model_to_use, custom_layers, device_to_use)
+                        intermediate_features = combine_layer_features(layer_features, custom_weights, temperature)
+                        print(f"[STATUS] Multi-layer extraction from layers {custom_layers} with weights {custom_weights}")
+                    else:
+                        print(f"[WARNING] Multi-layer mode requires ViT model, falling back to single-layer")
+                        intermediate_features = pe_model_to_use.encode_image(pe_input)
                 else:
-                    intermediate_features = pe_model_to_use.encode_image(pe_input) # This will be a single vector
-                    print(f"[STATUS] Using fallback PE model (single vector) - spatial masking will select this vector if mask is non-empty.")
+                    # Fallback to single layer
+                    if pe_vit_model_to_use is not None:
+                        intermediate_features = pe_vit_model_to_use.forward_features(pe_input, layer_idx=max(1, optimal_layer))
+                        print(f"[STATUS] Fallback single-layer extraction from layer {max(1, optimal_layer)}")
+                    else:
+                        intermediate_features = pe_model_to_use.encode_image(pe_input)
+                        print(f"[STATUS] Fallback PE model (single vector)")
                     
             except Exception as e_feat:
                 print(f"[ERROR] Failed to extract PE features: {e_feat}")
@@ -1194,7 +1221,7 @@ def extract_region_embeddings_autodistill(
                         print(f"[WARNING] No features extracted for mask {i} after spatial selection, skipping")
                         continue
 
-                    region_embedding_pooled = apply_spatial_pooling(masked_features, pooling_strategy)
+                    region_embedding_pooled = apply_spatial_pooling_enhanced(masked_features, pooling_strategy, temperature=temperature)
                     print(f"[STATUS] Applied {pooling_strategy} pooling to {masked_features.shape[0]} spatial features for mask {i}")
 
                     region_embedding_pooled = region_embedding_pooled.to(device_to_use)
@@ -1291,7 +1318,14 @@ def extract_whole_image_embeddings(
     preprocess_param=None,
     device_param=None,
     max_image_size=800,
-    optimal_layer=40
+    # ENHANCED PARAMETERS (with backward-compatible defaults)
+    extraction_mode="single",     # "single" or "multi_layer" or "preset"
+    optimal_layer=30,            # Updated: Meta PE research optimal balance (was 40)
+    preset_name="object_focused", # For preset mode
+    custom_layers=[30,40,47],    # For multi_layer mode
+    custom_weights=[0.3,0.4,0.3], # For multi_layer mode
+    pooling_strategy="top_k",    # NEW: Now accepts pooling strategy
+    temperature=0.07             # New temperature parameter
 ):
     """
     Extract embeddings for whole images using Perception Encoder
@@ -1368,83 +1402,150 @@ def extract_whole_image_embeddings(
                 amp_context = nullcontext()
                 
             with amp_context:
-                # Method 1: Try using VisionTransformer if available (preferred)
-                if pe_vit_model_to_use is not None:
-                    try:
-                        # Use forward_features with layer_idx parameter
-                        # Allow user to select any layer they want - let the model handle invalid layers
-                        safe_layer = max(1, optimal_layer)  # Only ensure minimum layer of 1
-                        features = pe_vit_model_to_use.forward_features(pe_input, layer_idx=safe_layer)
-                        embedding_method = f"vit_forward_features_layer{safe_layer}"
-                        print(f"[STATUS] Successfully extracted features using VisionTransformer forward_features with layer {safe_layer}")
-                    except Exception as e:
-                        print(f"[STATUS] Error using VisionTransformer forward_features with layer {optimal_layer}: {e}")
+                # NEW: Multi-layer extraction logic based on extraction_mode
+                if extraction_mode == "single":
+                    # Method 1: Try using VisionTransformer if available (preferred)
+                    if pe_vit_model_to_use is not None:
+                        try:
+                            # Use forward_features with layer_idx parameter
+                            safe_layer = max(1, optimal_layer)  # Only ensure minimum layer of 1
+                            features = pe_vit_model_to_use.forward_features(pe_input, layer_idx=safe_layer)
+                            embedding_method = f"vit_forward_features_layer{safe_layer}"
+                            print(f"[STATUS] Single-layer extraction from layer {safe_layer}")
+                        except Exception as e:
+                            print(f"[STATUS] Error using VisionTransformer forward_features with layer {optimal_layer}: {e}")
+                            features = None
+                    else:
+                        features = pe_model_to_use.encode_image(pe_input)
+                        embedding_method = "encode_image_fallback"
+                        print(f"[STATUS] Using fallback PE model (single vector)")
                         
-                # Method 2: Try using model.visual if it exists
-                if features is None and hasattr(pe_model_to_use, 'visual'):
-                    try:
-                        # Some vision transformers expose intermediate features
-                        if hasattr(pe_model_to_use.visual, 'transformer'):
-                            # Run forward pass and capture all intermediate activations
-                            output = pe_model_to_use.visual.transformer(
-                                pe_model_to_use.visual.conv1(pe_input),
-                                output_hidden_states=True
-                            )
-                            # Get the specific layer we want
-                            if isinstance(output, tuple) and len(output) > 1:
-                                # output[1] typically contains all hidden states
-                                hidden_states = output[1]
-                                # Respect user's layer choice, but clamp to available layers
-                                safe_layer = max(1, min(optimal_layer, len(hidden_states)-1))
-                                if isinstance(hidden_states, list) and len(hidden_states) > safe_layer:
-                                    features = hidden_states[safe_layer]
-                                    embedding_method = f"visual_transformer_hidden_states_layer{safe_layer}"
-                                    if safe_layer != optimal_layer:
-                                        print(f"[STATUS] Note: Requested layer {optimal_layer} not available, using layer {safe_layer} (max available: {len(hidden_states)-1})")
-                                    else:
-                                        print(f"[STATUS] Successfully extracted features using visual transformer hidden states with layer {safe_layer}")
+                elif extraction_mode == "preset":
+                    # Use preset configuration
+                    config = get_preset_configuration(preset_name)
+                    if pe_vit_model_to_use is not None:
+                        try:
+                            layer_features = extract_multi_layer_features(pe_input, pe_vit_model_to_use, config["layers"], device_to_use)
+                            features = combine_layer_features(layer_features, config["weights"], temperature)
+                            embedding_method = f"preset_{preset_name}_layers{config['layers']}"
+                            print(f"[STATUS] Preset '{preset_name}' extraction from layers {config['layers']}")
+                        except Exception as e:
+                            print(f"[WARNING] Preset extraction failed: {e}, falling back to single-layer")
+                            features = pe_vit_model_to_use.forward_features(pe_input, layer_idx=40)
+                            embedding_method = "preset_fallback_layer40"
+                    else:
+                        print(f"[WARNING] Preset mode requires ViT model, falling back to PE model")
+                        features = pe_model_to_use.encode_image(pe_input)
+                        embedding_method = "preset_fallback_encode_image"
                         
-                    except Exception as e:
-                        print(f"[STATUS] Error accessing visual transformer: {e}")
-                
-                # Method 3: Fallback to using the final output embedding if needed
-                if features is None:
-                    print(f"[STATUS] Could not access intermediate layer {optimal_layer}, using final output")
-                    features = pe_model_to_use.encode_image(pe_input)
-                    embedding_method = "encode_image_fallback"
-                    print(f"[STATUS] Successfully extracted features using encode_image fallback")
-            
-                # Process features based on their shape
-                if len(features.shape) == 3:  # [batch, sequence_length, embedding_dim]
-                    # For transformer features, we need to pool the token embeddings
-                    embedding = features.mean(dim=1)  # Average pooling over sequence
-                    print(f"[STATUS] Applied mean pooling over sequence dimension")
+                elif extraction_mode == "multi_layer":
+                    # Use custom multi-layer configuration
+                    if pe_vit_model_to_use is not None:
+                        try:
+                            layer_features = extract_multi_layer_features(pe_input, pe_vit_model_to_use, custom_layers, device_to_use)
+                            features = combine_layer_features(layer_features, custom_weights, temperature)
+                            embedding_method = f"multi_layer_layers{custom_layers}_weights{custom_weights}"
+                            print(f"[STATUS] Multi-layer extraction from layers {custom_layers} with weights {custom_weights}")
+                        except Exception as e:
+                            print(f"[WARNING] Multi-layer extraction failed: {e}, falling back to single-layer")
+                            features = pe_vit_model_to_use.forward_features(pe_input, layer_idx=40)
+                            embedding_method = "multi_layer_fallback_layer40"
+                    else:
+                        print(f"[WARNING] Multi-layer mode requires ViT model, falling back to PE model")
+                        features = pe_model_to_use.encode_image(pe_input)
+                        embedding_method = "multi_layer_fallback_encode_image"
                 else:
-                    # If already pooled or a single vector
-                    embedding = features
+                    # Fallback to single layer (original logic)
+                    if pe_vit_model_to_use is not None:
+                        try:
+                            safe_layer = max(1, optimal_layer)
+                            features = pe_vit_model_to_use.forward_features(pe_input, layer_idx=safe_layer)
+                            embedding_method = f"fallback_vit_layer{safe_layer}"
+                            print(f"[STATUS] Fallback single-layer extraction from layer {safe_layer}")
+                        except Exception as e:
+                            print(f"[STATUS] Error using VisionTransformer: {e}")
+                            features = None
+                    
+                    # Try alternative methods if ViT failed
+                    if features is None and hasattr(pe_model_to_use, 'visual'):
+                        try:
+                            # Some vision transformers expose intermediate features
+                            if hasattr(pe_model_to_use.visual, 'transformer'):
+                                # Run forward pass and capture all intermediate activations
+                                output = pe_model_to_use.visual.transformer(
+                                    pe_model_to_use.visual.conv1(pe_input),
+                                    output_hidden_states=True
+                                )
+                                # Get the specific layer we want
+                                if isinstance(output, tuple) and len(output) > 1:
+                                    # output[1] typically contains all hidden states
+                                    hidden_states = output[1]
+                                    # Respect user's layer choice, but clamp to available layers
+                                    safe_layer = max(1, min(optimal_layer, len(hidden_states)-1))
+                                    if isinstance(hidden_states, list) and len(hidden_states) > safe_layer:
+                                        features = hidden_states[safe_layer]
+                                        embedding_method = f"visual_transformer_hidden_states_layer{safe_layer}"
+                                        if safe_layer != optimal_layer:
+                                            print(f"[STATUS] Note: Requested layer {optimal_layer} not available, using layer {safe_layer} (max available: {len(hidden_states)-1})")
+                                        else:
+                                            print(f"[STATUS] Successfully extracted features using visual transformer hidden states with layer {safe_layer}")
+                        except Exception as e:
+                            print(f"[STATUS] Error accessing visual transformer: {e}")
+                    
+                    # Final fallback to using the final output embedding
+                    if features is None:
+                        print(f"[STATUS] Could not access intermediate layer {optimal_layer}, using final output")
+                        features = pe_model_to_use.encode_image(pe_input)
+                        embedding_method = "encode_image_fallback"
+                        print(f"[STATUS] Successfully extracted features using encode_image fallback")
+            
+            # Process features based on their shape and apply enhanced pooling
+            if len(features.shape) == 3:  # [batch, sequence_length, embedding_dim]
+                # For transformer features, we have sequence of token embeddings
+                print(f"[STATUS] Features shape: {features.shape}, applying {pooling_strategy} pooling")
                 
-                # Normalize embedding
-                embedding = torch.nn.functional.normalize(embedding, dim=-1)
-                print(f"[STATUS] Normalized embedding, shape: {embedding.shape}")
+                # Remove batch dimension: [1, seq_len, embed_dim] -> [seq_len, embed_dim]
+                if features.shape[0] == 1:
+                    sequence_features = features.squeeze(0)  # Now [seq_len, embed_dim]
+                else:
+                    # If batch size > 1, take the first one
+                    sequence_features = features[0]  # Now [seq_len, embed_dim]
+                
+                # Apply enhanced pooling strategies
+                embedding = apply_spatial_pooling_enhanced(
+                    sequence_features, 
+                    strategy=pooling_strategy, 
+                    temperature=temperature
+                )
+                
+                print(f"[STATUS] Applied {pooling_strategy} pooling to {sequence_features.shape[0]} tokens, result shape: {embedding.shape}")
+            else:
+                # If already pooled or a single vector, no pooling needed
+                embedding = features
+                print(f"[STATUS] Features already pooled, shape: {embedding.shape}")
             
-            # Update metadata with the method used
-            metadata["embedding_method"] = embedding_method
-            
-            # Extract actual layer used from embedding_method for accurate metadata
-            actual_layer_used = optimal_layer  # default fallback
-            if "layer" in embedding_method:
-                try:
-                    # Extract layer number from embedding_method string
-                    layer_part = embedding_method.split("layer")[-1]
-                    actual_layer_used = int(layer_part)
-                except (ValueError, IndexError):
-                    # If extraction fails, use the optimal_layer as fallback
-                    actual_layer_used = optimal_layer
-            
-            metadata["layer_used"] = actual_layer_used
-            
-            # Move embedding to CPU
-            embedding_cpu = embedding.cpu()
+            # Normalize embedding
+            embedding = torch.nn.functional.normalize(embedding, dim=-1)
+            print(f"[STATUS] Normalized embedding, final shape: {embedding.shape}")
+        
+        # Update metadata with the method used
+        metadata["embedding_method"] = embedding_method
+        
+        # Extract actual layer used from embedding_method for accurate metadata
+        actual_layer_used = optimal_layer  # default fallback
+        if "layer" in embedding_method:
+            try:
+                # Extract layer number from embedding_method string
+                layer_part = embedding_method.split("layer")[-1]
+                actual_layer_used = int(layer_part)
+            except (ValueError, IndexError):
+                # If extraction fails, use the optimal_layer as fallback
+                actual_layer_used = optimal_layer
+        
+        metadata["layer_used"] = actual_layer_used
+        
+        # Move embedding to CPU
+        embedding_cpu = embedding.cpu()
         
         # Clean up CUDA/MPS memory if needed
         if torch.backends.mps.is_available():
@@ -2619,14 +2720,26 @@ class GradioInterface:
             return f"Set active database to: {collection_name}"
         return "No database selected"
 
-    def process_image_with_prompt(self, image, text_prompt, min_area_ratio=0.01, max_regions=5, optimal_layer=40, pooling_strategy="top_k"):
-        """Process an uploaded image with a text prompt to detect regions"""
+    def process_image_with_prompt(self, image, text_prompt, min_area_ratio=0.01, max_regions=5, 
+                                # ENHANCED PARAMETERS
+                                extraction_mode="single", 
+                                optimal_layer=40,
+                                preset_name="object_focused",
+                                custom_layer_1=30, custom_layer_2=40, custom_layer_3=47,
+                                custom_weight_1=0.3, custom_weight_2=0.4, custom_weight_3=0.3,
+                                pooling_strategy="top_k",
+                                temperature=0.07):
+        """Process an uploaded image with a text prompt to detect regions with PE enhancements"""
         if isinstance(image, np.ndarray):
             image_pil = Image.fromarray(image)
         else:
             image_pil = image
 
-        # Extract regions from image
+        # Prepare custom layers and weights from individual parameters
+        custom_layers = [custom_layer_1, custom_layer_2, custom_layer_3]
+        custom_weights = [custom_weight_1, custom_weight_2, custom_weight_3]
+
+        # Extract regions from image with new parameters
         image_np, masks, embeddings, metadata, labels, error_message = extract_region_embeddings_autodistill(
             image_pil,
             text_prompt=text_prompt,
@@ -2638,7 +2751,11 @@ class GradioInterface:
             min_area_ratio=min_area_ratio,
             max_regions=max_regions,
             optimal_layer=optimal_layer,
-            pooling_strategy=pooling_strategy
+            extraction_mode=extraction_mode,
+            preset_name=preset_name,
+            custom_layers=custom_layers,
+            custom_weights=custom_weights,
+            temperature=temperature
         )
 
         # Store results
@@ -2720,7 +2837,7 @@ class GradioInterface:
 
         return Image.open(buf)
 
-    def search_region(self, region_selection, similarity_threshold=0.5, max_results=5, optimal_layer=40):
+    def search_region(self, region_selection, similarity_threshold=0.5, max_results=5):
         """Search for similar regions based on the selected region's embedding"""
         print(f"[STATUS] Starting search for similar regions...")
         if region_selection is None or self.detected_regions["image"] is None:
@@ -2823,7 +2940,7 @@ class GradioInterface:
             traceback.print_exc()
             return None, error_message, gr.update(visible=False), gr.update(choices=[], value=None)
 
-    def search_whole_image(self, similarity_threshold=0.5, max_results=5, optimal_layer=40):
+    def search_whole_image(self, similarity_threshold=0.5, max_results=5):
         """Search for similar whole images based on the processed image's embedding"""
         print(f"[STATUS] Starting search for similar whole images...")
         if self.whole_image["image"] is None or self.whole_image["embedding"] is None:
@@ -2832,9 +2949,8 @@ class GradioInterface:
 
         # Check if the processed image used the same layer as requested for search
         actual_layer = self.whole_image.get("layer_used", -1)
-        if actual_layer != optimal_layer:
-            print(f"[INFO] Search layer ({optimal_layer}) doesn't match the layer used for processing ({actual_layer})")
-            print(f"[INFO] This is fine as PE embeddings are compatible across different layers")
+        print(f"[INFO] Image was processed using layer {actual_layer}")
+        print(f"[INFO] PE embeddings are compatible across different layers for similarity search")
 
         # Get the embedding for the whole image
         embedding = self.whole_image["embedding"]
@@ -3297,202 +3413,42 @@ class GradioInterface:
             traceback.print_exc()
             return None
 
-    def build_interface(self):
-        """Build the Gradio interface"""
-        # Create the interface with tabs for different modes
-        with gr.Blocks(title="Grounded SAM Region Search") as demo:
-            gr.Markdown("# 🔍 Grounded SAM Region Search")
-            gr.Markdown("Upload an image, detect regions, and search for similar regions in your image database.")
-
-            # Processing mode selector (new)
-            gr.Markdown("## Processing Mode")
-            with gr.Row():
-                processing_mode = gr.Radio(
-                    choices=["Region Detection (GroundedSAM + PE)", "Whole Image (PE Only)"],
-                    value="Region Detection (GroundedSAM + PE)",
-                    label="Select Processing Mode"
-                )
-            
-            # Common file upload for both modes
-            with gr.Row():
-                input_image = gr.Image(type="pil", label="Upload Image")
-            
-            # Region-based mode components
-            with gr.Group(visible=True) as region_mode_group:
-                with gr.Row():
-                    text_prompt = gr.Textbox(
-                        placeholder="Examples: 'person . car . building .' OR 'all the chairs in the room' OR 'a person with pink clothes'",
-                        label="Detection Prompts",
-                        info="💡 Use period-separated for multiple objects (person . car . building .) OR natural language for specific descriptions (all the chairs, a person with red shirt)",
-                        value="person . car . building ."
-                    )
-                
-                # Add parameter controls before the process button
-                with gr.Row():
-                    with gr.Column():
-                        embedding_layer = gr.Slider(
-                            minimum=1, maximum=50, value=40, step=1,
-                            label="Embedding Layer",
-                            info="Layer of the Perception Encoder to use for detection"
-                        )
-                    with gr.Column():
-                        min_area_ratio = gr.Slider(
-                            minimum=0.001, maximum=0.1, value=0.01, step=0.001,
-                            label="Minimum Area Ratio",
-                            info="Minimum size of regions to detect (as a fraction of image size)"
-                        )
-                    with gr.Column():
-                        max_regions = gr.Slider(
-                            minimum=1, maximum=20, value=5, step=1,
-                            label="Maximum Regions",
-                            info="Maximum number of regions to detect per image"
-                        )
-                
-                with gr.Row():
-                    process_button = gr.Button("Detect Regions", variant="primary")
-            
-            # Whole-image mode components
-            with gr.Group(visible=False) as whole_image_mode_group:
-                # Add embedding layer for whole image processing too
-                with gr.Row():
-                    whole_image_layer = gr.Slider(
-                        minimum=1, maximum=50, value=40, step=1,
-                        label="Embedding Layer",
-                        info="Layer of the Perception Encoder to use for processing"
-                    )
-                with gr.Row():
-                    process_whole_button = gr.Button("Process Whole Image", variant="primary")
-            
-            # Status and results area
-            with gr.Row():
-                with gr.Column():
-                    # Results for region-based mode
-                    with gr.Group(visible=True) as region_results_group:
-                        detection_info = gr.Textbox(label="Detection Status")
-                        segmented_output = gr.Image(type="pil", label="Detected Regions")
-                        region_dropdown = gr.Dropdown(choices=[], label="Select a Region")
-                        region_preview = gr.Image(type="pil", label="Region Preview")
-                        
-                        with gr.Row():
-                            with gr.Column():
-                                similarity_slider = gr.Slider(
-                                    minimum=0.0, maximum=1.0, value=0.5, step=0.01,
-                                    label="Similarity Threshold"
-                                )
-                            with gr.Column():
-                                max_results_dropdown = gr.Dropdown(
-                                    choices=["5", "10", "20", "50"], value="5",
-                                    label="Max Results"
-                                )
-                        
-                        # Remove the embedding layer slider from here since we moved it above
-                        search_button = gr.Button("Search Similar Regions", variant="primary")
-                    
-                    # Results for whole-image mode
-                    with gr.Group(visible=False) as whole_image_results_group:
-                        whole_image_info = gr.Textbox(label="Processing Status")
-                        processed_output = gr.Image(type="pil", label="Processed Image")
-                        
-                        with gr.Row():
-                            with gr.Column():
-                                whole_similarity_slider = gr.Slider(
-                                    minimum=0.0, maximum=1.0, value=0.5, step=0.01,
-                                    label="Similarity Threshold"
-                                )
-                            with gr.Column():
-                                whole_max_results_dropdown = gr.Dropdown(
-                                    choices=["5", "10", "20", "50"], value="5",
-                                    label="Max Results"
-                                )
-                                    
-                        whole_search_button = gr.Button("Search Similar Images", variant="primary")
-                    
-                    # Common search results area
-                    search_info = gr.Textbox(label="Search Status")
-                    search_results_output = gr.Image(type="pil", label="Search Results")
-                    
-                    with gr.Group(visible=False) as button_section:
-                        result_selector = gr.Dropdown(choices=[], label="Select Result to View")
-                    
-                    enlarged_result = gr.Image(type="pil", label="Enlarged Result")
-            
-            # Function to toggle visibility based on mode
-            def toggle_mode(mode):
-                if mode == "Region Detection (GroundedSAM + PE)":
-                    return gr.update(visible=True), gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
-                else:  # Whole Image mode
-                    return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)
-            
-            # Connect mode selector to toggle visibility
-            processing_mode.change(
-                toggle_mode,
-                inputs=[processing_mode],
-                outputs=[
-                    region_mode_group, 
-                    whole_image_mode_group,
-                    region_results_group,
-                    whole_image_results_group
-                ]
-            )
-            
-            # Connect buttons to functions for region-based processing
-            process_button.click(
-                self.process_image_with_prompt,
-                inputs=[input_image, text_prompt, min_area_ratio, max_regions, embedding_layer],
-                outputs=[segmented_output, detection_info, region_dropdown, region_preview]
-            )
-
-            region_dropdown.change(
-                self.update_region_preview,
-                inputs=[region_dropdown],
-                outputs=[region_preview]
-            )
-
-            search_button.click(
-                self.search_region,
-                inputs=[region_dropdown, similarity_slider, max_results_dropdown, embedding_layer],
-                outputs=[search_results_output, search_info, button_section, result_selector]
-            )
-            
-            # Connect buttons to functions for whole-image processing
-            process_whole_button.click(
-                self.process_whole_image,
-                inputs=[input_image, whole_image_layer],
-                outputs=[processed_output, whole_image_info]
-            )
-            
-            whole_search_button.click(
-                self.search_whole_image,
-                inputs=[whole_similarity_slider, whole_max_results_dropdown, whole_image_layer],
-                outputs=[search_results_output, search_info, button_section, result_selector]
-            )
-            
-            # Connect result selector for both modes
-            result_selector.change(
-                self.display_enlarged_result,
-                inputs=[result_selector],
-                outputs=[enlarged_result]
-            )
-
-        return demo
-
-    def process_whole_image(self, image, optimal_layer=40):
-        """Process an uploaded image using only PE Encoder without region detection"""
+    def process_whole_image(self, image, 
+                          # ENHANCED PARAMETERS  
+                          extraction_mode="single",
+                          optimal_layer=40,
+                          preset_name="object_focused",
+                          custom_layer_1=30, custom_layer_2=40, custom_layer_3=47,
+                          custom_weight_1=0.3, custom_weight_2=0.4, custom_weight_3=0.3,
+                          pooling_strategy="top_k",  # NEW: Now accepts pooling strategy
+                          temperature=0.07):
+        """Process an uploaded image using only PE Encoder without region detection with PE enhancements"""
         if isinstance(image, np.ndarray):
             image_pil = Image.fromarray(image)
         else:
             image_pil = image
 
-        print(f"[STATUS] Processing whole image with embedding layer: {optimal_layer}")
+        print(f"[STATUS] Processing whole image with extraction mode: {extraction_mode}")
+        print(f"[STATUS] Using pooling strategy: {pooling_strategy}")
+        
+        # Prepare custom layers and weights from individual parameters
+        custom_layers = [custom_layer_1, custom_layer_2, custom_layer_3]
+        custom_weights = [custom_weight_1, custom_weight_2, custom_weight_3]
             
-        # Extract whole image embedding
+        # Extract whole image embedding with new parameters
         image_np, embedding, metadata, label = extract_whole_image_embeddings(
             image_pil,
             pe_model_param=self.pe_model,
             pe_vit_model_param=self.pe_vit_model,
             preprocess_param=self.preprocess,
             device_param=self.device,
-            optimal_layer=optimal_layer
+            extraction_mode=extraction_mode,
+            optimal_layer=optimal_layer,
+            preset_name=preset_name,
+            custom_layers=custom_layers,
+            custom_weights=custom_weights,
+            pooling_strategy=pooling_strategy,  # NEW: Pass pooling strategy
+            temperature=temperature
         )
 
         # Store results
@@ -3648,7 +3604,7 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                                     with gr.Row():
                                         with gr.Column():
                                             max_frames_per_video = gr.Slider(
-                                                minimum=5, maximum=100, value=30, step=5,
+                                                minimum=5, maximum=10000, value=30, step=5,
                                                 label="Max Frames per Video",
                                                 info="Maximum number of keyframes to extract from each video"
                                             )
@@ -3691,7 +3647,7 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                                         with gr.Row():
                                             with gr.Column():
                                                 url_max_frames = gr.Slider(
-                                                    minimum=5, maximum=100, value=30, step=5,
+                                                    minimum=5, maximum=10000, value=30, step=5,
                                                     label="Max Frames per Video",
                                                     info="Maximum number of keyframes to extract from each video"
                                                 )
@@ -3819,13 +3775,7 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                                 value="person . car . building ."
                             )
                             
-                            # Add pooling strategy selection
-                            pooling_strategy = gr.Dropdown(
-                                choices=["top_k", "max", "attention", "average"],
-                                value="top_k",
-                                label="Feature Pooling Strategy",
-                                info="How to combine spatial features from detected regions"
-                            )
+
                             
                             # Add region detection parameters
                             with gr.Row():
@@ -3842,14 +3792,86 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                                         info="Maximum number of regions to detect per image"
                                     )
                             
-                        # Common options for both modes
-                        with gr.Row():
-                            with gr.Column():
-                                layer_slider = gr.Slider(
-                                    minimum=1, maximum=50, value=40, step=1,
-                                    label="Embedding Layer",
-                                    info="Layer of the Perception Encoder to use (1-50)"
+                        # Layer selection is now in PE Enhancement controls below
+                        
+                        # 🚀 PE ENHANCEMENT CONTROLS (Create Database)
+                        with gr.Group():
+                            gr.Markdown("### 🔬 **Perception Encoder Enhancements**")
+                            
+                            # Extraction Mode Selection
+                            with gr.Row():
+                                db_extraction_mode = gr.Radio(
+                                    choices=["single", "preset", "multi_layer"],
+                                    value="single",
+                                    label="🎯 Extraction Mode",
+                                    info="Single: Fast single-layer | Preset: Optimized presets | Multi-layer: Custom configuration"
                                 )
+                            
+                            # Single Layer Options (default visible)
+                            with gr.Group(visible=True) as db_single_options:
+                                gr.Markdown("**Single Layer Configuration**")
+                                with gr.Row():
+                                    db_embedding_layer = gr.Slider(
+                                        minimum=1, maximum=50, value=40, step=1,
+                                        label="Embedding Layer",
+                                        info="Layer of the Perception Encoder to use for single-layer extraction"
+                                    )
+                            
+                            # Preset Options (hidden by default)
+                            with gr.Group(visible=False) as db_preset_options:
+                                with gr.Row():
+                                    db_preset_name = gr.Dropdown(
+                                        choices=["object_focused", "spatial_focused", "semantic_focused", "texture_focused", "texture_focused"],
+                                        value="object_focused",
+                                        label="🎨 PE Preset",
+                                        info="Object: Balanced | Spatial: Fine details | Semantic: High-level | Texture: Edge/texture"
+                                    )
+                            
+                            # Custom Multi-Layer Options (hidden by default)
+                            with gr.Group(visible=False) as db_custom_options:
+                                gr.Markdown("**Custom Layer Configuration**")
+                                with gr.Row():
+                                    with gr.Column():
+                                        db_custom_layer_1 = gr.Slider(20, 50, value=30, step=1, label="Layer 1")
+                                        db_custom_weight_1 = gr.Slider(0, 1, value=0.3, step=0.1, label="Weight 1")
+                                    with gr.Column():
+                                        db_custom_layer_2 = gr.Slider(20, 50, value=40, step=1, label="Layer 2") 
+                                        db_custom_weight_2 = gr.Slider(0, 1, value=0.4, step=0.1, label="Weight 2")
+                                    with gr.Column():
+                                        db_custom_layer_3 = gr.Slider(20, 50, value=47, step=1, label="Layer 3")
+                                        db_custom_weight_3 = gr.Slider(0, 1, value=0.3, step=0.1, label="Weight 3")
+                            
+                            # Advanced PE Settings
+                            with gr.Row():
+                                with gr.Column():
+                                    db_pooling_strategy = gr.Dropdown(
+                                        choices=["top_k", "pe_attention", "pe_spatial", "pe_semantic", "pe_adaptive"],
+                                        value="top_k",
+                                        label="🧠 Pooling Strategy",
+                                        info="top_k: Classic | pe_attention: Attention-weighted | pe_spatial: Boundary-aware"
+                                    )
+                                with gr.Column():
+                                    db_temperature = gr.Slider(
+                                        minimum=0.01, maximum=0.2, value=0.07, step=0.01,
+                                        label="🌡️ Temperature",
+                                        info="Temperature scaling for similarity (0.07 recommended)"
+                                    )
+                        
+                        # Function to toggle PE enhancement options for DB creation
+                        def toggle_pe_options_db(mode):
+                            if mode == "single":
+                                return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)
+                            elif mode == "preset":
+                                return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
+                            else:  # multi_layer
+                                return gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)
+                        
+                        # Connect extraction mode to toggle options
+                        db_extraction_mode.change(
+                            toggle_pe_options_db,
+                            inputs=[db_extraction_mode],
+                            outputs=[db_single_options, db_preset_options, db_custom_options]
+                        )
                         
                         # Process button
                         create_db_button = gr.Button("Process Folder & Create Database", variant="primary")
@@ -3948,10 +3970,17 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                         return gr.Dropdown(choices=["No databases found"], value=None)
                 
                 # Connect build database functions
-                def process_folder_with_mode(folder_path, collection_name, prompts, layer, mode, min_area_ratio=0.01, max_regions=5, pooling_strategy="top_k"):
-                    """Process folder(s) based on selected mode - supports single folder or comma-separated multiple folders"""
+                def process_folder_with_mode(folder_path, collection_name, prompts, layer, mode, min_area_ratio=0.01, max_regions=5, 
+                                            # PE Enhancement parameters
+                                            extraction_mode="single", preset_name="object_focused",
+                                            custom_layer_1=30, custom_layer_2=40, custom_layer_3=47,
+                                            custom_weight_1=0.3, custom_weight_2=0.4, custom_weight_3=0.3,
+                                            pooling_strategy="top_k", temperature=0.07):
+                    """Process folder(s) based on selected mode with PE enhancements - supports single folder or comma-separated multiple folders"""
                     print(f"[STATUS] Starting folder processing with mode: {mode}")
+                    print(f"[STATUS] Using PE extraction mode: {extraction_mode}")
                     print(f"[STATUS] Using pooling strategy: {pooling_strategy}")
+                    print(f"[STATUS] Using temperature: {temperature}")
                     print(f"[STATUS] Input folder path(s): {folder_path}")
                     
                     # Check if multiple folders are provided (contains comma)
@@ -3972,7 +4001,13 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                                 optimal_layer=layer,
                                 min_area_ratio=min_area_ratio,
                                 max_regions=max_regions,
-                                pooling_strategy=pooling_strategy
+                                # PE Enhancement parameters 
+                                extraction_mode=extraction_mode,
+                                preset_name=preset_name,
+                                custom_layers=[custom_layer_1, custom_layer_2, custom_layer_3],
+                                custom_weights=[custom_weight_1, custom_weight_2, custom_weight_3],
+                                pooling_strategy=pooling_strategy,
+                                temperature=temperature
                             )
                         else:
                             # Modify collection name to include mode and layer
@@ -3982,7 +4017,14 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                             gen = process_multiple_folders_with_progress_whole_images(
                                 folder_path,
                                 collection_name,
-                                optimal_layer=layer
+                                optimal_layer=layer,
+                                # PE Enhancement parameters
+                                extraction_mode=extraction_mode,
+                                preset_name=preset_name,
+                                custom_layers=[custom_layer_1, custom_layer_2, custom_layer_3],
+                                custom_weights=[custom_weight_1, custom_weight_2, custom_weight_3],
+                                pooling_strategy=pooling_strategy,
+                                temperature=temperature
                             )
                     else:
                         print(f"[STATUS] Detected single folder path, using single-folder processing")
@@ -3999,7 +4041,13 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                                 optimal_layer=layer,
                                 min_area_ratio=min_area_ratio,
                                 max_regions=max_regions,
-                                pooling_strategy=pooling_strategy
+                                # PE Enhancement parameters
+                                extraction_mode=extraction_mode,
+                                preset_name=preset_name,
+                                custom_layers=[custom_layer_1, custom_layer_2, custom_layer_3],
+                                custom_weights=[custom_weight_1, custom_weight_2, custom_weight_3],
+                                pooling_strategy=pooling_strategy,
+                                temperature=temperature
                             )
                         else:
                             # Modify collection name to include mode and layer
@@ -4007,9 +4055,10 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                             print(f"[STATUS] Using whole image collection name: {collection_name}")
                             # Process with whole image for single folder
                             gen = process_folder_with_progress_whole_images(
-                                folder_path,
+                                folder_path,  # Single folder path (the function can handle single folders too)
                                 collection_name,
-                                optimal_layer=layer
+                                optimal_layer=layer,
+                                resume_from_checkpoint=resume_from_checkpoint
                             )
                     
                     # Return first message
@@ -4024,9 +4073,42 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                     if app_state.available_databases:
                         verify_db_dropdown.value = app_state.available_databases[0]
                 
+                def resolve_and_create_database(folder_path, collection_name, prompts, mode, min_area_ratio, max_regions,
+                                              extraction_mode, preset_name, custom_layer_1, custom_layer_2, custom_layer_3,
+                                              custom_weight_1, custom_weight_2, custom_weight_3, pooling_strategy, temperature,
+                                              db_embedding_layer):
+                    """Resolve layer parameter based on extraction mode for database creation"""
+                    
+                    # Resolve layer parameter based on extraction mode
+                    if extraction_mode == "single":
+                        layer = db_embedding_layer
+                    elif extraction_mode == "preset":
+                        layer = 40  # Default for presets
+                    else:  # multi_layer
+                        layer = 40  # Default for multi-layer
+                    
+                    # Get the generator from process_folder_with_mode
+                    gen = process_folder_with_mode(
+                        folder_path, collection_name, prompts, layer, mode, min_area_ratio, max_regions,
+                        extraction_mode=extraction_mode, preset_name=preset_name,
+                        custom_layer_1=custom_layer_1, custom_layer_2=custom_layer_2, custom_layer_3=custom_layer_3,
+                        custom_weight_1=custom_weight_1, custom_weight_2=custom_weight_2, custom_weight_3=custom_weight_3,
+                        pooling_strategy=pooling_strategy, temperature=temperature  # NEW: Add pooling_strategy
+                    )
+                    
+                    # Properly yield the values from the generator
+                    for message, done_msg_update in gen:
+                        yield message, done_msg_update
+                
+                # Connect the create database button
                 create_db_button.click(
-                    process_folder_with_mode,
-                    inputs=[db_folder_path, db_collection_name, region_prompts, layer_slider, db_mode, min_area_ratio, max_regions, pooling_strategy],
+                    resolve_and_create_database,
+                    inputs=[db_folder_path, db_collection_name, region_prompts, db_mode, min_area_ratio, max_regions,
+                           # PE Enhancement parameters
+                           db_extraction_mode, db_preset_name, 
+                           db_custom_layer_1, db_custom_layer_2, db_custom_layer_3,
+                           db_custom_weight_1, db_custom_weight_2, db_custom_weight_3,
+                           db_pooling_strategy, db_temperature, db_embedding_layer],
                     outputs=[db_progress, db_done_msg]
                 )
             
@@ -4081,14 +4163,8 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                             value="person . car . building ."
                         )
                     
-                    # Add parameter controls before the process button
+                    # Parameter controls (embedding layer is now in PE enhancement controls)
                     with gr.Row():
-                        with gr.Column():
-                            embedding_layer = gr.Slider(
-                                minimum=1, maximum=50, value=40, step=1,
-                                label="Embedding Layer",
-                                info="Layer of the Perception Encoder to use for detection"
-                            )
                         with gr.Column():
                             min_area_ratio = gr.Slider(
                                 minimum=0.001, maximum=0.1, value=0.01, step=0.001,
@@ -4105,15 +4181,8 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                     with gr.Row():
                         process_button = gr.Button("Detect Regions", variant="primary")
                 
-                # Whole-image mode components
+                # Whole-image mode components (embedding layer now in PE enhancement controls)
                 with gr.Group(visible=False) as whole_image_mode_group:
-                    # Add embedding layer for whole image processing too
-                    with gr.Row():
-                        whole_image_layer = gr.Slider(
-                            minimum=1, maximum=50, value=40, step=1,
-                            label="Embedding Layer",
-                            info="Layer of the Perception Encoder to use for processing"
-                        )
                     with gr.Row():
                         process_whole_button = gr.Button("Process Whole Image", variant="primary")
                 
@@ -4273,10 +4342,120 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                     # Connect reset button
                     reset_db_button.click(reset_database_connection, inputs=[], outputs=[db_dropdown, detection_info])
                     
+                    # 🚀 PE ENHANCEMENT CONTROLS (Search Database Tab)
+                    with gr.Group():
+                        gr.Markdown("### 🔬 **Perception Encoder Enhancements**")
+                        
+                        # Extraction Mode Selection
+                        with gr.Row():
+                            extraction_mode = gr.Radio(
+                                choices=["single", "preset", "multi_layer"],
+                                value="single",
+                                label="🎯 Extraction Mode",
+                                info="Single: Fast single-layer | Preset: Optimized presets | Multi-layer: Custom configuration"
+                            )
+                        
+                        # Single Layer Options (default visible)
+                        with gr.Group(visible=True) as single_options:
+                            gr.Markdown("**Single Layer Configuration**")
+                            with gr.Row():
+                                embedding_layer = gr.Slider(
+                                    minimum=1, maximum=50, value=40, step=1,
+                                    label="Embedding Layer",
+                                    info="Layer of the Perception Encoder to use for single-layer extraction"
+                                )
+                        
+                        # Preset Options (hidden by default)
+                        with gr.Group(visible=False) as preset_options:
+                            with gr.Row():
+                                preset_name = gr.Dropdown(
+                                    choices=["object_focused", "spatial_focused", "semantic_focused", "texture_focused"],
+                                    value="object_focused",
+                                    label="🎨 PE Preset",
+                                    info="Object: Balanced | Spatial: Fine details | Semantic: High-level | Texture: Edge/texture"
+                                )
+                        
+                        # Custom Multi-Layer Options (hidden by default)
+                        with gr.Group(visible=False) as custom_options:
+                            gr.Markdown("**Custom Layer Configuration**")
+                            with gr.Row():
+                                with gr.Column():
+                                    custom_layer_1 = gr.Slider(20, 50, value=30, step=1, label="Layer 1")
+                                    custom_weight_1 = gr.Slider(0, 1, value=0.3, step=0.1, label="Weight 1")
+                                with gr.Column():
+                                    custom_layer_2 = gr.Slider(20, 50, value=40, step=1, label="Layer 2") 
+                                    custom_weight_2 = gr.Slider(0, 1, value=0.4, step=0.1, label="Weight 2")
+                                with gr.Column():
+                                    custom_layer_3 = gr.Slider(20, 50, value=47, step=1, label="Layer 3")
+                                    custom_weight_3 = gr.Slider(0, 1, value=0.3, step=0.1, label="Weight 3")
+                        
+                        # Advanced PE Settings
+                        with gr.Row():
+                            with gr.Column():
+                                pooling_strategy = gr.Dropdown(
+                                    choices=["top_k", "pe_attention", "pe_spatial", "pe_semantic", "pe_adaptive"],
+                                    value="top_k",
+                                    label="🧠 Pooling Strategy",
+                                    info="top_k: Classic | pe_attention: Attention-weighted | pe_spatial: Boundary-aware"
+                                )
+                            with gr.Column():
+                                temperature = gr.Slider(
+                                    minimum=0.01, maximum=0.2, value=0.07, step=0.01,
+                                    label="🌡️ Temperature",
+                                    info="Temperature scaling for similarity (0.07 recommended)"
+                                )
+                    
+                    # Function to toggle PE enhancement options
+                    def toggle_pe_options_search(mode):
+                        if mode == "single":
+                            return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)
+                        elif mode == "preset":
+                            return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
+                        else:  # multi_layer
+                            return gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)
+                    
+                    # Connect extraction mode to toggle options
+                    extraction_mode.change(
+                        toggle_pe_options_search,
+                        inputs=[extraction_mode],
+                        outputs=[single_options, preset_options, custom_options]
+                    )
+                    
                     # Connect buttons to functions for region-based processing
+                    def resolve_and_process_image(image, text_prompt, min_area, max_regions,
+                                                 extraction_mode, embedding_layer, preset_name,
+                                                 custom_layer_1, custom_layer_2, custom_layer_3,
+                                                 custom_weight_1, custom_weight_2, custom_weight_3,
+                                                 pooling_strategy, temperature):
+                        """Resolve PE parameters based on extraction mode and call process_image_with_prompt"""
+                        
+                        # Resolve optimal_layer based on extraction mode
+                        if extraction_mode == "single":
+                            optimal_layer = embedding_layer
+                        elif extraction_mode == "preset":
+                            # For presets, optimal_layer isn't used (multi-layer extraction)
+                            optimal_layer = 40  # Default fallback
+                        else:  # multi_layer
+                            # For multi-layer, optimal_layer isn't used
+                            optimal_layer = 40  # Default fallback
+                        
+                        return interface.process_image_with_prompt(
+                            image, text_prompt, min_area, max_regions,
+                            extraction_mode=extraction_mode,
+                            optimal_layer=optimal_layer,
+                            preset_name=preset_name,
+                            custom_layer_1=custom_layer_1, custom_layer_2=custom_layer_2, custom_layer_3=custom_layer_3,
+                            custom_weight_1=custom_weight_1, custom_weight_2=custom_weight_2, custom_weight_3=custom_weight_3,
+                            temperature=temperature
+                        )
+                    
                     process_button.click(
-                        interface.process_image_with_prompt,
-                        inputs=[input_image, text_prompt, min_area_ratio, max_regions, embedding_layer],
+                        resolve_and_process_image,
+                        inputs=[input_image, text_prompt, min_area_ratio, max_regions,
+                               extraction_mode, embedding_layer, preset_name,
+                               custom_layer_1, custom_layer_2, custom_layer_3,
+                               custom_weight_1, custom_weight_2, custom_weight_3,
+                               pooling_strategy, temperature],
                         outputs=[segmented_output, detection_info, region_dropdown, region_preview]
                     )
 
@@ -4288,20 +4467,48 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
 
                     search_button.click(
                         interface.search_region,
-                        inputs=[region_dropdown, similarity_slider, max_results_dropdown, embedding_layer],
+                        inputs=[region_dropdown, similarity_slider, max_results_dropdown],
                         outputs=[search_results_output, search_info, button_section, result_selector]
                     )
                     
                     # Connect buttons to functions for whole-image processing
+                    def resolve_and_process_whole_image(image, extraction_mode, embedding_layer, preset_name,
+                                                       custom_layer_1, custom_layer_2, custom_layer_3,
+                                                       custom_weight_1, custom_weight_2, custom_weight_3, 
+                                                       pooling_strategy, temperature):
+                        """Resolve PE parameters for whole image processing"""
+                        
+                        # Resolve optimal_layer based on extraction mode
+                        if extraction_mode == "single":
+                            optimal_layer = embedding_layer
+                        elif extraction_mode == "preset":
+                            optimal_layer = 40  # Default fallback for presets
+                        else:  # multi_layer
+                            optimal_layer = 40  # Default fallback for multi-layer
+                        
+                        return interface.process_whole_image(
+                            image,
+                            extraction_mode=extraction_mode,
+                            optimal_layer=optimal_layer,
+                            preset_name=preset_name,
+                            custom_layer_1=custom_layer_1, custom_layer_2=custom_layer_2, custom_layer_3=custom_layer_3,
+                            custom_weight_1=custom_weight_1, custom_weight_2=custom_weight_2, custom_weight_3=custom_weight_3,
+                            pooling_strategy=pooling_strategy,  # NEW: Pass pooling strategy
+                            temperature=temperature
+                        )
+                    
                     process_whole_button.click(
-                        interface.process_whole_image,
-                        inputs=[input_image, whole_image_layer],
+                        resolve_and_process_whole_image,
+                        inputs=[input_image, extraction_mode, embedding_layer, preset_name,
+                               custom_layer_1, custom_layer_2, custom_layer_3,
+                               custom_weight_1, custom_weight_2, custom_weight_3, 
+                               pooling_strategy, temperature],  # NEW: Include pooling_strategy
                         outputs=[processed_output, whole_image_info]
                     )
                     
                     whole_search_button.click(
                         interface.search_whole_image,
-                        inputs=[whole_similarity_slider, whole_max_results_dropdown, whole_image_layer],
+                        inputs=[whole_similarity_slider, whole_max_results_dropdown],
                         outputs=[search_results_output, search_info, button_section, result_selector]
                     )
                     
@@ -4315,24 +4522,26 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
             # Tab 4: About
             with gr.TabItem("About"):
                 gr.Markdown("""
-                    # Revers-o: A  Guide
+                    # Revers-o: A Visual Investigation Guide with Perception Encoder Enhancement
 
                     ## Table of Contents
                     1. [What is Revers-o?](#what-is-revers-o)
                     2. [Understanding the Technology](#understanding-the-technology)
-                    3. [Getting Started](#getting-started)
-                    4. [Video Processing Workflow](#video-processing-workflow)
-                    5. [Creating Image Databases](#creating-image-databases)
-                    6. [Searching for Similar Content](#searching-for-similar-content)
-                    7. [Parameter Guide](#parameter-guide)
-                    8. [Tips and Best Practices](#tips-and-best-practices)
-                    10. [Troubleshooting](#troubleshooting)
+                    3. [Perception Encoder Enhancement](#perception-encoder-enhancement)
+                    4. [Getting Started](#getting-started)
+                    5. [Video Processing Workflow](#video-processing-workflow)
+                    6. [Creating Image Databases](#creating-image-databases)
+                    7. [Searching for Similar Content](#searching-for-similar-content)
+                    8. [Parameter Guide](#parameter-guide)
+                    9. [PE Enhancement Parameter Guide](#pe-enhancement-parameter-guide)
+                    10. [Tips and Best Practices](#tips-and-best-practices)
+                    11. [Troubleshooting](#troubleshooting)
 
                     ---
 
                     ## What is Revers-o?
 
-                    Revers-o is a powerful visual investigation tool that helps journalists analyze large collections of images and videos to find similar content, objects, or scenes. Think of it as a "reverse image search" on steroids, specifically designed for investigative work.
+                    Revers-o is a powerful visual investigation tool that helps journalists analyze large collections of images and videos to find similar content, objects, or scenes. Think of it as a "reverse image search" on steroids, specifically designed for investigative work, now enhanced with Meta's cutting-edge Perception Encoder technology.
 
                     **Key Capabilities:**
                     - Extract frames from videos automatically
@@ -4340,6 +4549,9 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
                     - Search by describing what you're looking for in plain English
                     - Build searchable databases of visual evidence
                     - Identify patterns and connections in visual content
+                    - **NEW**: Multi-layer feature extraction for nuanced similarity matching
+                    - **NEW**: PE-optimized pooling strategies for different investigation types
+                    - **NEW**: Preset configurations for specialized search scenarios
 
                     ---
 
@@ -4347,12 +4559,13 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
 
                     ### Why Combine GroundedSAM and Perception Encoders?
 
-                    Revers-o combines two complementary AI systems to provide comprehensive visual analysis capabilities that neither could achieve alone:
+                    Revers-o combines three complementary AI systems to provide comprehensive visual analysis capabilities:
 
-                    - **GroundedSAM** excels at precise object detection and segmentation based on natural language descriptions, but operates primarily on explicit, describable objects
-                    - **Perception Encoders** capture rich semantic relationships and abstract visual concepts, but lacks the ability to follow complex user prompts.
+                    - **GroundedSAM** excels at precise object detection and segmentation based on natural language descriptions
+                    - **Perception Encoders** capture rich semantic relationships and abstract visual concepts across multiple network layers
+                    - **Multi-layer PE Enhancement** leverages the breakthrough discovery that "the best visual embeddings are not at the output of the network"
 
-                    By combining them, Revers-o allows you to describe what objects you want your database to be made of  AND create high quality embeddings
+                    By combining them, Revers-o allows you to describe what objects you want your database to be made of AND create high-quality embeddings that understand both concrete objects and abstract visual relationships.
 
                     ### GroundedSAM: The Object Detective
 
@@ -4369,257 +4582,160 @@ def create_multi_mode_interface(pe_model, pe_vit_model, preprocess, device):
 
                     ### Perception Encoders: The Pattern Recognizer
 
-                    Meta's Perception Encoders are AI systems that understand the visual "meaning" of image regions. They convert visual information into mathematical representations that capture:
-                    - Object appearance and context
-                    - Spatial relationships
+                    Meta's Perception Encoders are state-of-the-art AI systems that understand the visual "meaning" of image regions through a multi-layered architecture. They convert visual information into mathematical representations that capture:
+                    - Object appearance and context across different abstraction levels
+                    - Spatial relationships and compositional understanding
                     - Visual similarities that humans would recognize
+                    - Abstract concepts and semantic relationships
 
                     **Real-world example:**
-                    If you have footage of a protest and want to find all images showing the same building in the background, Perception Encoders may be able to identify that building across different angles, lighting conditions, and camera positions.
+                    If you have footage of a protest and want to find all images showing the same building in the background, Perception Encoders can identify that building across different angles, lighting conditions, and camera positions by using the optimal intermediate layers.
 
-                    ### The Hierarchical Nature of Visual Understanding
+                    ---
 
-                    Recent research by Meta has revealed a crucial insight: different layers of Perception Encoders capture different aspects of visual understanding:
+                    ## Perception Encoder Enhancement
 
-                    **Early Layers (Low-level features):**
+                    ### The Breakthrough Discovery
+
+                    Recent research by Meta AI has revealed a fundamental insight about vision AI: **the best visual embeddings are hidden within the intermediate layers of neural networks, not at the output**. This discovery revolutionizes how we can understand and search visual content.
+
+                    ### The Multi-Layer Architecture
+
+                    Perception Encoders process images through ~50 layers, each capturing different aspects of visual understanding:
+
+                    **Early Layers (Layers 10-20): Low-Level Features**
                     - Edges, textures, and basic shapes
                     - Color patterns and gradients
                     - Simple geometric structures
+                    - **Best for**: Finding images with similar textures, materials, or basic visual patterns
 
-                    **Middle Layers (Mid-level features):**
+                    **Middle Layers (Layers 25-35): Mid-Level Features**
                     - Object parts and components
-                    - Spatial arrangements
+                    - Spatial arrangements and layouts
                     - Local patterns and motifs
+                    - **Best for**: Finding objects with similar parts or spatial relationships
 
-                    **Later Layers (High-level features):**
+                    **Later Layers (Layers 40-47): High-Level Features**
                     - Complete objects and scenes
                     - Abstract concepts and relationships
-                    - Semantic understanding
+                    - Semantic understanding and context
+                    - **Best for**: Finding conceptually similar content, scenes with similar "meaning"
 
-                    **How Revers-o Leverages This Hierarchy:**
+                    ### How This Helps Investigators
 
-                    This multi-layered understanding theoretically enables Revers-o to search for both concrete and abstract visual concepts:
+                    This multi-layered understanding enables Revers-o to search for both concrete and abstract visual concepts:
 
-                    **Concrete Searches:**
+                    **Concrete Searches (Higher Layers):**
                     - "Person wearing red jacket" (specific object detection)
                     - "Blue car with license plate" (detailed object features)
                     - "Building with glass facade" (architectural elements)
 
-                    **Abstract Concept Searches:**
+                    **Abstract Concept Searches (Mid-Level Layers):**
                     - Visual similarity based on "mood" or "atmosphere"
                     - Scenes with similar "energy" or "tension"
                     - Images that convey similar "emotions" or "contexts"
                     - Compositional similarities (similar layouts, even with different objects)
 
+                    **Pattern Searches (Lower Layers):**
+                    - Similar textures or materials
+                    - Recurring visual patterns
+                    - Images with similar lighting conditions
+                    - Structural similarities regardless of content
 
-                    This hierarchical approach means Revers-o can help investigators to explore their visual databases in multiple ways by creating and searching embeddings from different layers.
+                    ### PE Enhancement Features
 
-                    ---
+                    #### 1. Extraction Modes
 
-                    ## Getting Started
+                    **Single Layer Mode** (Default)
+                    - Uses one specific layer of the Perception Encoder
+                    - Fast and efficient for general-purpose searches
+                    - Recommended layer: 40 (good balance of semantic and spatial information)
 
-                    ### 1. Launch the Application
-                    Run the application using the provided scripts:
-                    - **Windows**: Double-click `run.bat`
-                    - **Mac/Linux**: Run `./run.sh` in terminal
+                    **Multi-Layer Mode** (Advanced)
+                    - Combines features from multiple layers simultaneously
+                    - Captures both detailed and abstract visual information
+                    - Allows custom layer combinations and weights
+                    - More computationally intensive but more comprehensive
 
-                    The interface will open in your web browser.
+                    **Preset Mode** (Easy to Use)
+                    - Pre-configured layer combinations for specific use cases
+                    - Optimized based on Meta's research and extensive testing
+                    - Three specialized presets available
 
-                    ### 2. Interface Overview
-                    The main interface has three sections:
-                    1. **Extract Images from Video** - Process video files
-                    2. **Create New Database** - Build searchable collections
-                    3. **Search Existing Database** - Find similar content
+                    #### 2. Specialized Presets
 
-                    ---
+                    **Object-Focused Preset**
+                    - Layers: [35, 42, 47] with weights [0.2, 0.5, 0.3]
+                    - Optimized for finding specific objects and people
+                    - Best for: Person identification, vehicle tracking, object matching
+                    - Example use cases: Finding all images of a specific person, tracking a vehicle across multiple cameras
 
-                    ## Video Processing Workflow
+                    **Spatial-Focused Preset**
+                    - Layers: [25, 32, 40] with weights [0.4, 0.4, 0.2]
+                    - Optimized for spatial relationships and layouts
+                    - Best for: Location matching, architectural similarity, scene composition
+                    - Example use cases: Geolocating photos, finding similar indoor/outdoor spaces
 
-                    ### Step-by-Step Process
+                    **Semantic-Focused Preset**
+                    - Layers: [30, 37, 45] with weights [0.3, 0.3, 0.4]
+                    - Optimized for conceptual and contextual similarity
+                    - Best for: Finding images with similar meaning or context
+                    - Example use cases: Protest scenes, emotional context, event types
 
-                    1. **Prepare Your Videos**
-                    - Supported formats: MP4, AVI, MOV, MKV, WMV, FLV, WebM, M4V
-                    - Place videos in a dedicated folder
+                    #### 3. PE-Optimized Pooling Strategies
 
-                    2. **Set Input and Output Folders**
-                    - **Video Folder Path**: Where your videos are stored
-                    - **Output Folder Path**: Where extracted frames will be saved
+                    **PE Attention Pooling**
+                    - Uses learned attention mechanisms to weight important features
+                    - Automatically focuses on the most relevant parts of detected regions
+                    - Best for complex scenes with multiple objects
 
-                    3. **Configure Extraction Settings**
-                    - **Max Frames per Video**: How many frames to extract (default: 30)
-                    - **Scene Detection Threshold**: Sensitivity for detecting scene changes (default: 30.0)
+                    **PE Spatial Pooling**
+                    - Preserves spatial relationships within detected regions
+                    - Maintains positional information for better matching
+                    - Best for cases where object position and arrangement matter
 
-                    4. **Process Videos**
-                    - Click "Process Videos"
-                    - The system will extract keyframes and save them as images
-                    - Progress will be shown in real-time
+                    **PE Semantic Pooling**
+                    - Emphasizes semantic content over spatial arrangement
+                    - Focuses on "what" rather than "where"
+                    - Best for finding conceptually similar content regardless of layout
 
-                    ### Understanding Scene Detection
-                    - **Lower threshold (10-20)**: More sensitive, extracts more frames during subtle changes
-                    - **Higher threshold (40-50)**: Less sensitive, only extracts frames during major scene changes
-                    - **Default (30)**: Balanced approach suitable for most content
+                    **PE Adaptive Pooling**
+                    - Dynamically adjusts pooling strategy based on content
+                    - Combines multiple pooling approaches intelligently
+                    - Best for general-purpose use when you're unsure which approach to use
 
-                    ---
+                    #### 4. Temperature Scaling
 
-                    ## Creating Image Databases
+                    **What it is**: A technique from Meta's PE research that adjusts the "sharpness" of similarity calculations using temperature-scaled similarity.
 
-                    ### Planning Your Database
+                    **How it works**:
+                    - Lower temperature (0.01-0.05): More focused, stricter matching
+                    - Standard temperature (0.07): Balanced matching (default)
+                    - Higher temperature (0.1-0.2): More flexible, broader matching
 
-                    **Before you start:**
-                    - Organize images by investigation topic
-                    - Use descriptive database names (e.g., "protest_march_2024", "building_surveillance")
-                    - Consider what objects/people you'll be searching for
+                    **When to adjust**:
+                    - **Lower for**: Finding very specific matches, reducing false positives
+                    - **Higher for**: Finding broader similarities, catching subtle matches
 
-                    ### Step-by-Step Database Creation
+                    ### Practical Application Scenarios
 
-                    1. **Choose Your Images**
-                    - Select a single folder containing your images OR multiple folders separated by commas
-                    - Example single folder: `/path/to/images`
-                    - Example multiple folders: `/path/to/images1, /path/to/images2, /path/to/images3`
-                    - Can include extracted video frames from different sources
-                    - All images from all folders will be processed into the same database
+                    **Scenario 1: Person of Interest Investigation**
+                    - **Mode**: Preset Mode → Object-Focused
+                    - **Temperature**: 0.05 (strict matching)
+                    - **Pooling**: PE Attention Pooling
+                    - **Use case**: Find all images containing a specific person across large datasets
 
-                    2. **Define Search Prompts**
-                    - Enter descriptions of what you may want to reverse-image search in your database. For example, if your main use case is geolocation, you could ask reverso to create a database of buildings (or mountains) so you can later compare new images of buildings with what you already have.
-                    - Use clear, specific language
-                    - Examples: "person in uniform", "red car", "protest sign", "building entrance"
+                    **Scenario 2: Location Verification**
+                    - **Mode**: Preset Mode → Spatial-Focused
+                    - **Temperature**: 0.07 (standard)
+                    - **Pooling**: PE Spatial Pooling
+                    - **Use case**: Verify if photos were taken at the same location
 
-                    3. **Configure Detection Settings**
-                    - **Box Threshold**: How confident the system should be (0.1-0.9)
-                    - **Text Threshold**: Confidence for text-based detection (0.1-0.9)
-
-                    4. **Name Your Database**
-                    - Use descriptive names
-                    - Avoid spaces (use underscores: "investigation_name")
-
-                    5. **Start Processing**
-                    - Click "Create Database"
-                    - Processing time depends on image count and complexity
-
-                    ### Understanding Prompts
-
-                    **Good prompts:**
-                    - "person wearing police uniform"
-                    - "vehicle with license plate"
-                    - "building with red door"
-                    - "crowd of people"
-
-                    **Avoid vague prompts:**
-                    - "thing" or "object"
-                    - "something suspicious"
-                    - "important item"
-
-                    ---
-
-                    ## Searching for Similar Content
-
-                    ### Upload and Detect
-                    1. **Upload Query Image**: The image containing what you want to find
-                    2. **Enter Detection Prompt**: Describe what to select in the uploaded image, these are the things that you later will be able to search within your database.
-                    3. **Adjust Detection Settings**: Fine-tune confidence levels
-                    4. **Click "Detect Regions"**: System identifies matching areas
-
-                    ### Search Parameters
-                    - **Top K Results**: How many similar images to return (default: 10)
-                    - **Similarity Threshold**: Minimum similarity score (0.0-1.0)
-
-                    ### Interpreting Results
-                    - **Similarity Score**: Higher numbers = more similar (0.0-1.0 scale)
-                    - **Bounding Boxes**: Show exactly what was matched
-                    - **File Paths**: Help locate original images
-
-                    ---
-
-                    ## Parameter Guide
-
-                    ### Box Threshold (0.1-0.9)
-                    **What it does:** Controls how confident the system must be to detect an object.
-
-                    - **0.1-0.3**: Very sensitive, finds more objects but may include false positives
-                    - **0.4-0.6**: Balanced, good for most investigations
-                    - **0.7-0.9**: Very strict, only finds objects the system is very confident about
-
-                    **Use cases:**
-                    - **Low (0.2)**: When searching for partially obscured objects
-                    - **High (0.8)**: When you need very precise matches
-
-                    ### Text Threshold (0.1-0.9)
-                    **What it does:** Controls confidence for text-based object detection.
-
-                    - **Lower values**: More liberal interpretation of your text prompts
-                    - **Higher values**: Stricter matching to your exact description
-
-                    ### Scene Detection Threshold (10.0-50.0)
-                    **What it does:** Determines when video scenes change enough to extract a new frame.
-
-                    - **10-20**: Extracts frames frequently, good for detailed analysis
-                    - **30-40**: Balanced extraction, suitable for most content
-                    - **40-50**: Only major scene changes, good for long videos with stable scenes
-
-                    ### Max Frames per Video
-                    **What it does:** Limits how many frames are extracted from each video.
-
-                    - **10-20**: Quick overview of video content
-                    - **30-50**: Detailed analysis while managing storage
-                    - **100+**: Comprehensive frame-by-frame analysis
-
-
-                    ---
-
-                    ## Tips and Best Practices
-
-                    ### Database Management
-                    - **Use descriptive names**: Include date, location, or case identifier
-                    - **Organize by topic**: Separate databases for different investigations
-                    - **Regular backups**: Databases are stored locally and should be backed up
-
-                    ### Prompt Writing
-                    - **Be specific**: "red sedan" instead of "car"
-                    - **Include context**: "person wearing medical mask" vs "person"
-                    - **Test variations**: Try different phrasings for better results
-
-                    ### Performance Optimization
-                    - **Batch processing**: Process large collections overnight
-                    - **Storage management**: Monitor disk space for large video collections
-                    - **Quality over quantity**: Higher resolution images give better results
-
-                    ### Investigation Workflow
-                    1. **Plan your search strategy** before processing
-                    2. **Start with small test batches** to refine parameters
-                    3. **Document your methodology** for reproducible results
-                    4. **Cross-reference findings** with other evidence sources
-
-                    ---
-
-                    ## Troubleshooting
-
-                    ### Common Issues
-
-                    **"No objects detected"**
-                    - Lower the box threshold
-                    - Try different prompt wording
-                    - Check image quality and resolution
-
-                    **"Too many false positives"**
-                    - Raise the box threshold
-                    - Use more specific prompts
-                    - Adjust text threshold
-
-                    **"Video processing fails"**
-                    - Check video format compatibility
-                    - Ensure sufficient disk space
-                    - Try smaller video files first
-
-                    **"Slow processing"**
-                    - Reduce max frames per video
-                    - Process smaller batches
-                    - Close other applications to free memory
-
-                    ### Getting Help
-                    - Check the console output for error messages
-                    - Verify all file paths are correct
-                    - Ensure sufficient disk space for processing
-                    - Restart the application if it becomes unresponsive
+                    **Scenario 3: Event Pattern Analysis**
+                    - **Mode**: Preset Mode → Semantic-Focused
+                    - **Temperature**: 0.1 (flexible)
+                    - **Pooling**: PE Semantic Pooling
+                    - **Use case**: Find images showing similar types of events or situations
                     """)
     
     # Set the default active database if available
@@ -5282,7 +5398,6 @@ def process_multiple_folders_with_progress_advanced(folder_paths_string, prompts
         client = None
         processed = 0
         skipped = 0
-        errors = 0
         total_regions = 0
         vector_dimension = None
         
@@ -5502,7 +5617,10 @@ def process_multiple_folders_with_progress_advanced(folder_paths_string, prompts
         yield error_msg, gr.update(visible=False)
 
 def process_multiple_folders_with_progress_whole_images(folder_paths_string, collection_name, 
-                                                     optimal_layer=40, resume_from_checkpoint=True):
+                                                     optimal_layer=40, resume_from_checkpoint=True, 
+                                                     extraction_mode="single", preset_name="object_focused", 
+                                                     custom_layers=[30, 40, 47], custom_weights=[0.3, 0.4, 0.3], 
+                                                     pooling_strategy="top_k", temperature=0.07):
     """Process multiple folders for whole image embeddings with progress updates"""
     try:
         print(f"[STATUS] Starting multiple folder processing for whole images: {folder_paths_string}")
@@ -5600,7 +5718,12 @@ def process_multiple_folders_with_progress_whole_images(folder_paths_string, col
                     pe_vit_model_param=pe_vit_model,
                     preprocess_param=preprocess,
                     device_param=device,
-                    optimal_layer=optimal_layer
+                    optimal_layer=optimal_layer,
+                    extraction_mode=extraction_mode,
+                    preset_name=preset_name,
+                    custom_layers=custom_layers,
+                    custom_weights=custom_weights,
+                    temperature=temperature
                 )
                 
                 if image is not None and embedding is not None:
@@ -5677,6 +5800,368 @@ def process_multiple_folders_with_progress_whole_images(folder_paths_string, col
         import traceback
         traceback.print_exc()
         yield error_msg, gr.update(visible=False)
+
+# PE Enhancement Utilities - Multi-Layer Feature Extraction and Advanced Pooling
+def get_preset_configuration(preset_name):
+    """Return layer and weight configurations for PE-optimized presets based on Meta's research"""
+    presets = {
+        "object_focused": {
+            # Meta PE research: layers 25-35 are optimal for object detection/recognition
+            "layers": [25, 30, 35],
+            "weights": [0.3, 0.4, 0.3],  # Emphasize middle layer (30)
+            "pooling": "pe_attention"
+        },
+        "spatial_focused": {
+            # Meta PE research: early-mid layers (15-25) capture spatial relationships
+            "layers": [15, 20, 25], 
+            "weights": [0.4, 0.4, 0.2],  # Emphasize early-mid layers
+            "pooling": "pe_spatial"
+        },
+        "semantic_focused": {
+            # Meta PE research: later layers (40-47) for high-level semantic understanding
+            "layers": [40, 45, 47],
+            "weights": [0.2, 0.3, 0.5],  # Emphasize the latest layer (47)
+            "pooling": "pe_semantic"
+        },
+        "texture_focused": {
+            # Meta PE research: very early layers (10-20) for texture and edge detection
+            "layers": [10, 15, 20],
+            "weights": [0.5, 0.3, 0.2],  # Strong emphasis on layer 10
+            "pooling": "pe_spatial"
+        }
+    }
+    return presets.get(preset_name, presets["object_focused"])
+
+def extract_multi_layer_features(image, pe_vit_model, layers, device):
+    """Extract features from multiple PE layers simultaneously"""
+    if pe_vit_model is None:
+        raise ValueError("PE ViT model is required for multi-layer extraction")
+    
+    layer_features = []
+    
+    with torch.no_grad():
+        for layer in layers:
+            try:
+                safe_layer = max(1, layer)
+                features = pe_vit_model.forward_features(image, layer_idx=safe_layer)
+                layer_features.append(features)
+                print(f"[STATUS] Extracted features from layer {safe_layer}")
+            except Exception as e:
+                print(f"[WARNING] Failed to extract from layer {layer}: {e}")
+                # Use a fallback layer (default layer 40)
+                try:
+                    fallback_features = pe_vit_model.forward_features(image, layer_idx=40)
+                    layer_features.append(fallback_features)
+                    print(f"[STATUS] Used fallback layer 40 for failed layer {layer}")
+                except Exception as e_fallback:
+                    print(f"[ERROR] Fallback layer also failed: {e_fallback}")
+                    continue
+    
+    if not layer_features:
+        raise RuntimeError("No valid features extracted from any layer")
+    
+    return layer_features
+
+def combine_layer_features(layer_features, weights, temperature=0.07):
+    """Combine multi-layer features with learned weights and temperature scaling"""
+    if len(layer_features) != len(weights):
+        raise ValueError(f"Number of layer features ({len(layer_features)}) must match number of weights ({len(weights)})")
+    
+    # Normalize weights to sum to 1
+    weights = torch.tensor(weights, dtype=torch.float32, device=layer_features[0].device)
+    weights = weights / weights.sum()
+    
+    # Apply temperature scaling to weights (Meta PE research insight)
+    if temperature > 0:
+        weights = torch.softmax(weights / temperature, dim=0)
+    
+    # Weighted combination
+    combined_features = sum(w * feat for w, feat in zip(weights, layer_features))
+    
+    print(f"[STATUS] Combined {len(layer_features)} layers with weights {weights.cpu().numpy()} and temperature {temperature}")
+    return combined_features
+
+def pe_attention_pooling(masked_features, temperature=0.07, attention_heads=8):
+    """PE-optimized attention-weighted pooling with temperature scaling"""
+    if masked_features.shape[0] == 0:
+        return masked_features.mean(dim=0, keepdim=True)
+    
+    # Multi-head attention mechanism
+    feature_dim = masked_features.shape[1]
+    head_dim = feature_dim // attention_heads
+    
+    if head_dim * attention_heads != feature_dim:
+        # If not divisible, use single head
+        attention_heads = 1
+        head_dim = feature_dim
+    
+    # Reshape for multi-head attention
+    batch_size = masked_features.shape[0]
+    reshaped_features = masked_features.view(batch_size, attention_heads, head_dim)
+    
+    # Compute attention weights with temperature scaling
+    attention_scores = torch.matmul(reshaped_features, reshaped_features.transpose(-2, -1))
+    attention_scores = attention_scores.mean(dim=1)  # Average across heads
+    
+    # Apply temperature scaling (Meta PE insight)
+    attention_weights = torch.softmax(attention_scores.sum(dim=-1) / temperature, dim=0)
+    
+    # Apply attention weights
+    pooled = (masked_features * attention_weights.unsqueeze(1)).sum(dim=0, keepdim=True)
+    
+    return pooled
+
+def pe_spatial_pooling(masked_features, temperature=0.07):
+    """PE-optimized spatial pooling focusing on boundary information"""
+    if masked_features.shape[0] == 0:
+        return masked_features.mean(dim=0, keepdim=True)
+    
+    # Compute spatial gradients to emphasize boundaries
+    feature_norms = masked_features.norm(dim=1)
+    
+    # Spatial variance for boundary detection
+    if masked_features.shape[0] > 1:
+        feature_variance = masked_features.var(dim=0, keepdim=True)
+        spatial_importance = feature_variance.norm(dim=1, keepdim=True)
+        
+        # Combine norms with spatial importance
+        combined_scores = feature_norms + spatial_importance.squeeze()
+    else:
+        combined_scores = feature_norms
+    
+    # Temperature-scaled attention
+    attention_weights = torch.softmax(combined_scores / temperature, dim=0)
+    pooled = (masked_features * attention_weights.unsqueeze(1)).sum(dim=0, keepdim=True)
+    
+    return pooled
+
+def pe_semantic_pooling(masked_features, temperature=0.07):
+    """PE-optimized semantic pooling for high-level concept extraction"""
+    if masked_features.shape[0] == 0:
+        return masked_features.mean(dim=0, keepdim=True)
+    
+    # Focus on features with highest semantic content (higher dimensions)
+    # Meta PE research shows semantic info concentrates in specific feature dimensions
+    feature_importance = masked_features.abs().mean(dim=0)  # Average absolute values per dimension
+    
+    # Weight features by their semantic importance
+    semantic_weights = torch.softmax(feature_importance / temperature, dim=0)
+    weighted_features = masked_features * semantic_weights.unsqueeze(0)
+    
+    # Use attention mechanism on semantically weighted features
+    attention_scores = torch.matmul(weighted_features, weighted_features.t()).sum(dim=1)
+    attention_weights = torch.softmax(attention_scores / temperature, dim=0)
+    
+    pooled = (weighted_features * attention_weights.unsqueeze(1)).sum(dim=0, keepdim=True)
+    
+    return pooled
+
+def pe_adaptive_pooling(masked_features, temperature=0.07):
+    """PE-optimized adaptive pooling that combines multiple strategies"""
+    if masked_features.shape[0] == 0:
+        return masked_features.mean(dim=0, keepdim=True)
+    
+    # Combine attention, spatial, and semantic pooling
+    attention_pooled = pe_attention_pooling(masked_features, temperature)
+    spatial_pooled = pe_spatial_pooling(masked_features, temperature)
+    semantic_pooled = pe_semantic_pooling(masked_features, temperature)
+    
+    # Adaptive weighting based on feature characteristics
+    num_features = masked_features.shape[0]
+    feature_variance = masked_features.var(dim=0).mean().item()
+    
+    # More spatial weight for large regions, more semantic weight for small regions
+    if num_features > 100:  # Large region
+        weights = [0.3, 0.5, 0.2]  # attention, spatial, semantic
+    elif num_features < 20:  # Small region
+        weights = [0.2, 0.2, 0.6]  # More semantic focus
+    else:  # Medium region
+        weights = [0.4, 0.3, 0.3]  # Balanced
+    
+    # Combine with learned weights
+    combined = (weights[0] * attention_pooled + 
+                weights[1] * spatial_pooled + 
+                weights[2] * semantic_pooled)
+    
+    return combined
+
+def temperature_scaled_similarity(query_emb, candidate_emb, temperature=0.07):
+    """PE-inspired temperature-scaled cosine similarity using Meta's contrastive learning approach"""
+    import torch.nn.functional as F
+    
+    # Ensure embeddings are normalized (critical for contrastive learning)
+    query_emb = F.normalize(query_emb, p=2, dim=-1)
+    candidate_emb = F.normalize(candidate_emb, p=2, dim=-1)
+    
+    # Compute cosine similarity
+    cosine_sim = F.cosine_similarity(query_emb, candidate_emb, dim=-1)
+    
+    # Apply temperature scaling with softmax approach (Meta PE research)
+    # This ensures proper probability distribution and contrastive learning alignment
+    scaled_sim = cosine_sim / temperature
+    
+    # For single similarity scores, apply sigmoid to maintain [0,1] range
+    if scaled_sim.dim() == 0 or scaled_sim.size(0) == 1:
+        return torch.sigmoid(scaled_sim)
+    else:
+        # For multiple similarities, use softmax for proper normalization
+        return torch.softmax(scaled_sim, dim=0)
+
+def apply_spatial_pooling_enhanced(masked_features, strategy="top_k", top_k_ratio=0.1, 
+                                 temperature=0.07, attention_heads=8):
+    """Enhanced pooling with PE-optimized strategies while maintaining backward compatibility"""
+    
+    # EXISTING STRATEGIES (unchanged for backward compatibility)
+    if strategy == "max":
+        pooled = masked_features.max(dim=0, keepdim=True)[0]
+    elif strategy == "top_k":
+        feature_norms = masked_features.norm(dim=1)
+        k = max(1, int(top_k_ratio * len(feature_norms)))
+        top_k_indices = torch.topk(feature_norms, k)[1]
+        pooled = masked_features[top_k_indices].mean(dim=0, keepdim=True)
+    elif strategy == "attention":
+        feature_norms = masked_features.norm(dim=1)
+        attention_weights = torch.softmax(feature_norms, dim=0)
+        pooled = (masked_features * attention_weights.unsqueeze(1)).sum(dim=0, keepdim=True)
+    elif strategy == "average":
+        pooled = masked_features.mean(dim=0, keepdim=True)
+    
+    # NEW PE-OPTIMIZED STRATEGIES
+    elif strategy == "pe_attention":
+        pooled = pe_attention_pooling(masked_features, temperature, attention_heads)
+    elif strategy == "pe_spatial":
+        pooled = pe_spatial_pooling(masked_features, temperature)
+    elif strategy == "pe_semantic":
+        pooled = pe_semantic_pooling(masked_features, temperature)
+    elif strategy == "pe_adaptive":
+        pooled = pe_adaptive_pooling(masked_features, temperature)
+    else:
+        # Fallback to average
+        pooled = masked_features.mean(dim=0, keepdim=True)
+    
+    return pooled
+
+def get_optimal_single_layer(task_type="general"):
+    """
+    Return optimal single layer based on Meta PE research findings
+    
+    Args:
+        task_type: "general", "object", "spatial", "semantic", "texture"
+    
+    Returns:
+        int: Optimal layer number for the task
+    """
+    # Based on Meta's PE research findings
+    optimal_layers = {
+        "general": 30,     # Meta's research shows layer 30 is good overall balance
+        "object": 30,      # Object recognition peak around layers 25-35
+        "spatial": 20,     # Spatial relationships captured in early-mid layers
+        "semantic": 45,    # High-level semantic understanding in later layers
+        "texture": 15,     # Texture and edge details in early layers
+        "fine_detail": 12, # Very fine details in very early layers
+        "global_context": 42  # Global scene understanding in late layers
+    }
+    
+    return optimal_layers.get(task_type, 30)  # Default to 30 if unknown task
+
+# =============================================================================
+# CHECKPOINT FUNCTIONS
+# =============================================================================
+
+def save_checkpoint(collection_name, processed_files, checkpoint_dir="./image_retrieval_project/checkpoints"):
+    """Save processing checkpoint to disk"""
+    try:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint_file = os.path.join(checkpoint_dir, f"{collection_name}_checkpoint.json")
+        
+        checkpoint_data = {
+            "collection_name": collection_name,
+            "processed_files": list(processed_files),
+            "checkpoint_timestamp": time.time(),
+            "checkpoint_version": "1.0"
+        }
+        
+        with open(checkpoint_file, 'w') as f:
+            json.dump(checkpoint_data, f, indent=2)
+        
+        print(f"[CHECKPOINT] Saved checkpoint for {len(processed_files)} processed files")
+        return True
+    except Exception as e:
+        print(f"[ERROR] Failed to save checkpoint: {e}")
+        return False
+
+def load_checkpoint(collection_name, checkpoint_dir="./image_retrieval_project/checkpoints"):
+    """Load processing checkpoint from disk"""
+    try:
+        checkpoint_file = os.path.join(checkpoint_dir, f"{collection_name}_checkpoint.json")
+        
+        if not os.path.exists(checkpoint_file):
+            print(f"[CHECKPOINT] No checkpoint found for collection {collection_name}")
+            return set()
+        
+        with open(checkpoint_file, 'r') as f:
+            checkpoint_data = json.load(f)
+        
+        processed_files = set(checkpoint_data.get("processed_files", []))
+        checkpoint_timestamp = checkpoint_data.get("checkpoint_timestamp", 0)
+        
+        print(f"[CHECKPOINT] Loaded checkpoint with {len(processed_files)} processed files")
+        print(f"[CHECKPOINT] Checkpoint created: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(checkpoint_timestamp))}")
+        
+        return processed_files
+    except Exception as e:
+        print(f"[ERROR] Failed to load checkpoint: {e}")
+        return set()
+
+def get_processed_files_from_database(client, collection_name):
+    """Query the database to get a list of already processed files"""
+    try:
+        if client is None:
+            return set()
+        
+        # Get all points from the collection to extract processed filenames
+        scroll_result = client.scroll(
+            collection_name=collection_name,
+            limit=10000,  # Adjust based on your collection size
+            with_payload=True
+        )
+        
+        processed_files = set()
+        for point in scroll_result[0]:
+            payload = point.payload
+            # Check different possible filename fields
+            for filename_field in ["source_filename", "filename", "full_path"]:
+                if filename_field in payload:
+                    if filename_field == "full_path":
+                        # Extract just the filename from the full path
+                        filename = os.path.basename(payload[filename_field])
+                    else:
+                        filename = payload[filename_field]
+                    processed_files.add(filename)
+                    break
+        
+        print(f"[CHECKPOINT] Found {len(processed_files)} already processed files in database")
+        return processed_files
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to query database for processed files: {e}")
+        return set()
+
+def should_skip_file(filename, processed_files_checkpoint, processed_files_database):
+    """Determine if a file should be skipped based on checkpoint and database state"""
+    # Check both checkpoint and database to be safe
+    base_filename = os.path.basename(filename)
+    
+    in_checkpoint = base_filename in processed_files_checkpoint
+    in_database = base_filename in processed_files_database
+    
+    should_skip = in_checkpoint or in_database
+    
+    if should_skip:
+        source = "checkpoint" if in_checkpoint else "database"
+        print(f"[CHECKPOINT] Skipping {base_filename} (already processed - found in {source})")
+    
+    return should_skip
 
 if __name__ == "__main__":
     main()

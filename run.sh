@@ -10,7 +10,7 @@ NC='\033[0m' # No Color
 echo -e "${BLUE}[STARTUP]${NC} Activating environment..."
 source .venv/bin/activate
 
-echo -e "${BLUE}[STARTUP]${NC} Starting Revers-o..."
+echo -e "${BLUE}[STARTUP]${NC} Starting Revers-o: GroundedSAM + Perception Encoders Image Similarity Search..."
 
 # Set environment variables
 if [[ "$(uname -m)" == "arm64" && "$OSTYPE" == "darwin"* ]]; then

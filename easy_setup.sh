@@ -211,12 +211,43 @@ else
     print_success "Perception models repository cloned successfully"
 fi
 
+# Modify perception_models requirements.txt for Apple Silicon compatibility
+if [[ "$OSTYPE" == "darwin"* && "$(uname -m)" == "arm64" ]]; then
+    print_progress "Modifying perception_models requirements for Apple Silicon compatibility..."
+    if [ -f "perception_models/requirements.txt" ]; then
+        # Backup original file
+        cp perception_models/requirements.txt perception_models/requirements.txt.bak
+        
+        # Replace decord with eva-decord
+        sed -i '' 's/decord==0.6.0/eva-decord==0.6.1/g' perception_models/requirements.txt
+        sed -i '' 's/decord>=0.6.0/eva-decord==0.6.1/g' perception_models/requirements.txt
+        sed -i '' 's/decord/eva-decord==0.6.1/g' perception_models/requirements.txt
+        
+        print_success "Modified perception_models requirements.txt for Apple Silicon compatibility"
+    else
+        print_warning "perception_models requirements.txt not found, skipping compatibility modifications"
+    fi
+fi
+
 # Install dependencies from perception_models repository
 print_progress "Installing dependencies from perception_models repository..."
 if [ -f "perception_models/requirements.txt" ]; then
     print_success "Dependencies for perception_models will be installed via main requirements.txt"
 else
     print_warning "perception_models requirements.txt not found, skipping extra dependencies"
+fi
+
+# Install perception_models package in development mode
+print_progress "Installing perception_models package in development mode..."
+cd perception_models
+uv pip install -e .
+cd ..
+if [ $? -eq 0 ]; then
+    print_success "Perception models package installed successfully"
+else
+    print_error "Failed to install perception_models package"
+    print_error "Please try running: cd perception_models && pip install -e ."
+    exit 1
 fi
 
 # The import paths in main.py are now assumed to be correct for the ./perception_models structure.
