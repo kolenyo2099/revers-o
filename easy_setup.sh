@@ -215,13 +215,15 @@ fi
 if [[ "$OSTYPE" == "darwin"* && "$(uname -m)" == "arm64" ]]; then
     print_progress "Modifying perception_models requirements for Apple Silicon compatibility..."
     if [ -f "perception_models/requirements.txt" ]; then
-        # Backup original file
+        # First backup the original file
         cp perception_models/requirements.txt perception_models/requirements.txt.bak
         
-        # Replace decord with eva-decord
+        # Replace in a specific order to avoid double replacement
+        # First replace specific version patterns
         sed -i '' 's/decord==0.6.0/eva-decord==0.6.1/g' perception_models/requirements.txt
         sed -i '' 's/decord>=0.6.0/eva-decord==0.6.1/g' perception_models/requirements.txt
-        sed -i '' 's/decord/eva-decord==0.6.1/g' perception_models/requirements.txt
+        # Then replace remaining standalone "decord" instances, making sure not to match "eva-decord"
+        sed -i '' 's/\<decord\>/eva-decord==0.6.1/g' perception_models/requirements.txt
         
         print_success "Modified perception_models requirements.txt for Apple Silicon compatibility"
     else

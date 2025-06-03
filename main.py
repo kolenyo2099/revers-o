@@ -14,18 +14,16 @@ import matplotlib
 matplotlib.use('Agg') # Use non-interactive backend
 import torch
 
+# Initialize perception_models import paths
+from init_perception_models import setup_perception_models_imports
+setup_perception_models_imports()
+
 # Core application modules
 from core.device import setup_device
 from core.models import load_pe_model # This function will set globals in core.models
 from core.database import cleanup_qdrant_connections
 from gradio_ui.tabs import create_multi_mode_interface
 # AppState is initialized within create_multi_mode_interface, which imports it from core.app_state
-
-# Ensure perception_models directory is in sys.path
-# This allows core.models to import from core.vision_encoder.pe etc.
-perception_models_path = os.path.abspath('./perception_models')
-if perception_models_path not in sys.path:
-    sys.path.append(perception_models_path)
 
 def main():
     # Parse command line arguments

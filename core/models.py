@@ -1,8 +1,10 @@
 import torch
 import sys
+import os
 
 # Add perception_models to path
 sys.path.append('./perception_models')
+# These imports will be handled by our import hook
 import core.vision_encoder.pe as pe
 import core.vision_encoder.transforms as transforms
 
