@@ -1001,15 +1001,15 @@ class SimpleReverso:
                         log_status(f"⚠️ No regions found in {filename}, skipping")
                         failed += 1
                         continue
-                
-                # Add source info to metadata
-                for meta in metadata:
-                    meta["image_source"] = image_path
+                    
+                    # Add source info to metadata
+                    for meta in metadata:
+                        meta["image_source"] = image_path
                     meta["filename"] = filename
-                
-                all_embeddings.extend(embeddings)
-                all_metadata.extend(metadata)
-                processed += 1
+                    
+                    all_embeddings.extend(embeddings)
+                    all_metadata.extend(metadata)
+                    processed += 1
                 
             except Exception as e:
                 log_status(f"❌ Error processing {filename}: {str(e)}")
@@ -1097,7 +1097,7 @@ class SimpleReverso:
             
             results_text += f"{i+1}. {filename} (similarity: {score:.3f})\n"
             results_text += f"   📍 Bounding box: {bbox}\n\n"
-            
+        
             # Load and process the similar image
             if os.path.exists(image_path):
                 try:
@@ -1149,7 +1149,7 @@ class SimpleReverso:
         """Create visualization of detected regions, highlighting the selected region if provided"""
         if not self.detected_regions:
             return None
-
+        
         # Convert image to RGB if it's not already
         if isinstance(image, np.ndarray):
             if len(image.shape) == 2:  # Grayscale
@@ -1170,7 +1170,7 @@ class SimpleReverso:
 
         fig, ax = plt.subplots(figsize=(10, 8))
         ax.imshow(image)
-
+        
         for i in range(len(self.detected_regions)):
             print(f"\n[DEBUG] Processing region {i+1}")
             
@@ -1212,16 +1212,16 @@ class SimpleReverso:
                 if len(x_coords) > 0 and len(y_coords) > 0:
                     center_x = int(x_coords.mean())
                     center_y = int(y_coords.mean())
-                    ax.text(center_x, center_y, f"{i+1}",
-                            color='white', fontsize=12, fontweight='bold',
+                    ax.text(center_x, center_y, f"{i+1}", 
+                           color='white', fontsize=12, fontweight='bold',
                             bbox=dict(boxstyle="round,pad=0.3", facecolor=label_facecolor, alpha=0.7))
                     print(f"[DEBUG] Added label at ({center_x}, {center_y})")
             else:
                 print(f"[DEBUG] Region {i+1} has no mask")
-
+        
         ax.set_title(f"Detected Regions ({len(self.detected_regions)} found)")
         ax.axis('off')
-
+        
         temp_path = f"/tmp/visualization_{uuid.uuid4().hex[:8]}.png"
         plt.savefig(temp_path, bbox_inches='tight', dpi=150)
         plt.close()
@@ -1277,8 +1277,8 @@ def create_simple_interface():
                     region_options.append(f"Region {i+1}: {detected_class} (Confidence: {confidence:.3f})")
                 
                 result_text = (f"✅ Found {num_regions} regions\n"
-                             f"🧠 Extracted {len(embeddings)} embeddings\n"
-                             f"🎯 Select a region to search with")
+                              f"🧠 Extracted {len(embeddings)} embeddings\n"
+                              f"🎯 Select a region to search with")
                 
                 return viz_image, result_text, gr.update(choices=region_options, value=region_options[0], visible=True), metadata
             
@@ -1318,21 +1318,32 @@ def create_simple_interface():
                         reverso.region_embeddings = [reverso.region_embeddings[0]]
             
             result_text, similar_images = reverso.search_similar(similarity_threshold, max_results)
+            
             # Create a list of image options for the dropdown
             image_options = [f"Image {i+1} (Score: {score:.3f})" for i, (_, score) in enumerate(similar_images) if similar_images[i] is not None]
+            
+            # Create a gallery of thumbnails
+            thumbnail_gallery = []
+            for i, (img, score) in enumerate(similar_images):
+                if img is not None:
+                    # Create a smaller thumbnail version
+                    thumbnail = img.copy()
+                    thumbnail.thumbnail((200, 200))  # Resize to thumbnail size
+                    thumbnail_gallery.append(thumbnail)
             
             # Return the results with the new choices and value
             return (
                 result_text,
                 gr.update(choices=image_options, value=image_options[0] if image_options else None),
                 similar_images[0][0] if similar_images and similar_images[0] is not None else None,
-                similar_images  # Store images in state
+                similar_images,  # Store images in state
+                thumbnail_gallery  # Return the gallery value directly
             )
         except Exception as e:
             print(f"❌ Search error: {str(e)}")
             import traceback
             traceback.print_exc()
-            return f"❌ Search error: {str(e)}", gr.update(choices=[], value=None), None, []
+            return f"❌ Search error: {str(e)}", gr.update(choices=[], value=None), None, [], []  # Return empty list for gallery
     
     def update_similar_image(selected_image, state):
         """Update the displayed similar image based on selection"""
@@ -1558,12 +1569,13 @@ def create_simple_interface():
                 search_results = gr.Textbox(label="🔍 Search Results", lines=10)
                 similar_image_selector = gr.Dropdown(label="Select Similar Image", choices=[], value=None, info="Choose an image to view")
                 similar_image_display = gr.Image(label="Selected Similar Image", type="pil")
+                thumbnail_gallery = gr.Gallery(label="Search Results Thumbnails", columns=3, height=300)
                 
                 # Search uses selected region
                 search_btn.click(
                     search_database,
                     inputs=[similarity_threshold, max_results, similar_images_state, region_selector],
-                    outputs=[search_results, similar_image_selector, similar_image_display, similar_images_state]
+                    outputs=[search_results, similar_image_selector, similar_image_display, similar_images_state, thumbnail_gallery]
                 )
                 
                 similar_image_selector.change(
@@ -1591,6 +1603,7 @@ def create_simple_interface():
                             load_btn = gr.Button("📂 Load Database", variant="primary")
                             delete_btn = gr.Button("🗑️ Delete Database", variant="stop")
                             unlock_btn = gr.Button("🔓 Unlock Database", variant="secondary")
+                            reload_btn = gr.Button("🔄 Reload List", variant="secondary")
                         
                         db_status = gr.Textbox(
                             label="Status",
@@ -1615,6 +1628,19 @@ def create_simple_interface():
                     unlock_selected_database,
                     inputs=[db_selector],
                     outputs=[db_status]
+                )
+
+                def reload_database_list():
+                    """Reload the list of available databases"""
+                    databases = reverso.list_databases()
+                    if not databases:
+                        return gr.update(choices=[], value=None), "No databases found"
+                    return gr.update(choices=databases, value=databases[0]), f"✅ Reloaded database list. Found {len(databases)} databases."
+                
+                reload_btn.click(
+                    reload_database_list,
+                    inputs=[],
+                    outputs=[db_selector, db_status]
                 )
             
             # Tab 4: About

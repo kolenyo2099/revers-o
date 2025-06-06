@@ -79,9 +79,9 @@ Edit `config.py` to customize:
    - Check your internet connection
    - Make sure git is installed
    - Try cloning manually:
-     ```bash
-     git clone https://github.com/facebookresearch/perception_models.git
-     ```
+   ```bash
+   git clone https://github.com/facebookresearch/perception_models.git
+   ```
 
 ## 📝 License
 
