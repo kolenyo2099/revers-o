@@ -469,35 +469,40 @@ def extract_frames_with_progress(urls, folder, fps=2, thresh=30, qual="720p", pr
 
     return f"✅ Completed! Extracted {total_frames} frames from {len(valid_urls)} videos to {folder}"
 
-def process_local_videos_with_progress(input_folder, output_folder, fps=2, thresh=30, progress=None):
-    """Process local videos with progress updates for Gradio."""
+def process_local_videos_with_progress(input_folder, output_folder, fps, thresh, progress=None):
+    """Process all videos in a folder with progress tracking."""
     if not input_folder or not output_folder:
         return "❌ Please provide input and output folders"
 
     os.makedirs(output_folder, exist_ok=True)
-    video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.webm']
-    video_files = [f for f in os.listdir(input_folder) if any(f.lower().endswith(ext) for ext in video_extensions)]
-
+    video_files = [f for f in os.listdir(input_folder) if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv'))]
+    
     if not video_files:
-        return f"❌ No video files found in {input_folder}"
+        return "❌ No video files found in the input folder."
 
     status_messages = []
-    def log_status(message):
+    def log_status(message, progress_value=None):
         status_messages.append(message)
-        if progress: progress(desc=message)
+        try:
+            if progress_value is not None:
+                progress(progress_value, desc=message)
+            else:
+                progress(0.0, desc=message)
+        except Exception:
+            pass  # Ignore progress update errors
         return "\n".join(status_messages)
 
-    log_status(f"📁 Found {len(video_files)} videos to process")
+    log_status(f"📁 Found {len(video_files)} videos to process", 0.0)
     total_frames = 0
 
     for i, video_file in enumerate(video_files):
         try:
             video_path = os.path.join(input_folder, video_file)
-            log_status(f"🎬 Processing video {i+1}/{len(video_files)}: {video_file}")
+            log_status(f"🎬 Processing video {i+1}/{len(video_files)}: {video_file}", 0.2 * (i / len(video_files)))
 
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
-                log_status(f"❌ Could not open video: {video_file}")
+                log_status(f"❌ Could not open video: {video_file}", 0.2 * ((i + 1) / len(video_files)))
                 continue
 
             # Get video info
@@ -513,7 +518,7 @@ def process_local_videos_with_progress(input_folder, output_folder, fps=2, thres
             scenes = scene_manager.get_scene_list()
 
             if not scenes:
-                log_status(f"⚠️ No scenes detected in {video_file}, using uniform sampling")
+                log_status(f"⚠️ No scenes detected in {video_file}, using uniform sampling", 0.4 * (i / len(video_files)))
                 frame_interval = int(fps_video / fps)
                 for frame_idx in range(0, total_frames_video, frame_interval):
                     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -527,7 +532,7 @@ def process_local_videos_with_progress(input_folder, output_folder, fps=2, thres
                         cv2.imwrite(frame_path, frame)
                         total_frames += 1
             else:
-                log_status(f"✅ Detected {len(scenes)} scenes")
+                log_status(f"✅ Detected {len(scenes)} scenes", 0.4 * (i / len(video_files)))
                 for scene in scenes:
                     start_frame = scene[0].frame_num
                     end_frame = scene[1].frame_num
@@ -546,11 +551,11 @@ def process_local_videos_with_progress(input_folder, output_folder, fps=2, thres
                             total_frames += 1
 
             cap.release()
-            log_status(f"✅ Extracted {total_frames} frames from {video_file}")
+            log_status(f"✅ Extracted frames from {video_file}", 0.2 * ((i + 1) / len(video_files)))
 
         except Exception as e:
-            log_status(f"❌ Error processing {video_file}: {str(e)}")
-            import traceback; traceback.print_exc()
+            log_status(f"❌ Error processing {video_file}: {str(e)}", 0.2 * ((i + 1) / len(video_files)))
+            continue
 
     return f"✅ Completed! Extracted {total_frames} frames from {len(video_files)} videos to {output_folder}"
 
