@@ -115,7 +115,7 @@ def search_database_ui(similarity_threshold, max_results, current_search_results
     """Search database for similar images using the current query image."""
     try:
         if not reverso.vector_db:
-            return "⚠️ No database loaded. Please create or load a database first.", [], []
+            return "⚠️ No database loaded. Please create or load a database first.", None, []
 
         if not reverso.region_embeddings:
             return "⚠️ No embeddings available. Please detect regions first.", [], []
@@ -344,7 +344,7 @@ def create_simple_interface():
 
                 search_results_summary_textbox = gr.Textbox(label="🔍 Search Results Summary", lines=10, interactive=False)
                 
-                # Replace single image display with Gallery
+                # Gallery for displaying similar images
                 similar_images_gallery = gr.Gallery(
                     label="Similar Image Results",
                     show_label=True,
