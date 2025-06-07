@@ -115,10 +115,10 @@ def search_database_ui(similarity_threshold, max_results, current_search_results
     """Search database for similar images using the current query image."""
     try:
         if not reverso.vector_db:
-            return "⚠️ No database loaded. Please create or load a database first.", gr.update(choices=[], value=None), None, []
+            return "⚠️ No database loaded. Please create or load a database first.", [], []
 
         if not reverso.region_embeddings:
-            return "⚠️ No embeddings available. Please detect regions first.", gr.update(choices=[], value=None), None, []
+            return "⚠️ No embeddings available. Please detect regions first.", [], []
 
         if selected_region_info and selected_region_info != "Region 1:":
             try:
@@ -141,17 +141,22 @@ def search_database_ui(similarity_threshold, max_results, current_search_results
             # Default search using the first (or only) detected embedding
             result_text, similar_items_data = reverso.search_similar(similarity_threshold, max_results)
 
-        image_options = [f"Image {i+1} (Score: {item['score']:.3f})" for i, item in enumerate(similar_items_data) if item["image"] is not None]
+        # Format images for gallery display
+        gallery_images = []
+        for item in similar_items_data:
+            if item["image"] is not None:
+                # Add caption with score and filename
+                caption = f"Score: {item['score']:.3f} | {item.get('filename', 'Unknown')}"
+                gallery_images.append((item["image"], caption))
 
         return (
             result_text,
-            gr.update(choices=image_options, value=image_options[0] if image_options else None),
-            similar_items_data[0]["image"] if similar_items_data and similar_items_data[0]["image"] else None,
+            gallery_images,
             similar_items_data
         )
     except Exception as e:
         traceback.print_exc()
-        return f"❌ Search error: {str(e)}", gr.update(choices=[], value=None), None, []
+        return f"❌ Search error: {str(e)}", [], []
 
 def update_similar_image_ui(selected_image_option, search_results_data_state):
     """Update the displayed similar image based on dropdown selection."""
@@ -167,7 +172,7 @@ def update_similar_image_ui(selected_image_option, search_results_data_state):
                 # Add filename and score as text overlay
                 draw = ImageDraw.Draw(img)
                 try:
-                    font = ImageFont.truetype("Arial", 20)
+                    font = ImageFont.truetype("Arial", 12)  # Smaller font size
                 except:
                     font = ImageFont.load_default()
                 
@@ -181,12 +186,12 @@ def update_similar_image_ui(selected_image_option, search_results_data_state):
                 text_width = text_bbox[2] - text_bbox[0]
                 text_height = text_bbox[3] - text_bbox[1]
                 draw.rectangle(
-                    [(0, 0), (text_width + 20, text_height + 20)],
-                    fill=(0, 0, 0, 128)
+                    [(0, 0), (text_width + 10, text_height + 10)],  # Smaller padding
+                    fill=(0, 0, 0, 100)  # More transparent background
                 )
                 
                 # Add text
-                draw.text((10, 10), text, fill=(255, 255, 255), font=font)
+                draw.text((5, 5), text, fill=(255, 255, 255), font=font)  # Smaller padding
                 return img
         return None
     except Exception as e:
@@ -254,7 +259,7 @@ def create_simple_interface():
                             url_extraction_status_markdown = gr.Markdown("URL processing status...")
 
                             url_extract_button.click(
-                                lambda urls, folder, fps, thresh, qual: extract_frames_with_progress(urls, folder, fps, thresh, qual, progress=gr.Progress()),
+                                lambda urls, folder, fps, thresh, qual: extract_frames_with_progress(urls, folder, fps, thresh, qual, progress=None),
                                 inputs=[video_urls_input, url_output_folder_input, url_frames_per_scene_slider, url_scene_threshold_slider, url_max_quality_dropdown],
                                 outputs=[url_extraction_status_markdown]
                             )
@@ -338,19 +343,23 @@ def create_simple_interface():
                 search_db_button = gr.Button("🎯 Search Database", variant="primary")
 
                 search_results_summary_textbox = gr.Textbox(label="🔍 Search Results Summary", lines=10, interactive=False)
-                similar_image_selector_dropdown = gr.Dropdown(label="Select Result to View", choices=[], interactive=True)
-                similar_image_display = gr.Image(label="Selected Similar Image Result", type="pil", interactive=False)
+                
+                # Replace single image display with Gallery
+                similar_images_gallery = gr.Gallery(
+                    label="Similar Image Results",
+                    show_label=True,
+                    columns=[2, 3, 4, 5],
+                    rows=[1, 2, 2, 3],
+                    height="auto",
+                    object_fit="contain",
+                    allow_preview=True,
+                    show_download_button=True
+                )
 
                 search_db_button.click(
                     search_database_ui, # uses global reverso
                     inputs=[similarity_threshold_slider, max_results_dropdown, similar_items_state, query_region_selector_dropdown],
-                    outputs=[search_results_summary_textbox, similar_image_selector_dropdown, similar_image_display, similar_items_state]
-                )
-
-                similar_image_selector_dropdown.change(
-                    update_similar_image_ui,
-                    inputs=[similar_image_selector_dropdown, similar_items_state], # Pass the state containing all result data
-                    outputs=[similar_image_display]
+                    outputs=[search_results_summary_textbox, similar_images_gallery, similar_items_state]
                 )
 
             with gr.TabItem("⚙️ Database Management"):
