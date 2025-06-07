@@ -276,7 +276,7 @@ def create_simple_interface():
                         local_extraction_status_markdown = gr.Markdown("Local video processing status...")
 
                         local_extract_button.click(
-                            lambda in_fold, out_fold, fps, thresh: process_local_videos_with_progress(in_fold, out_fold, fps, thresh, progress=gr.Progress(track_tqdm=True)),
+                            lambda in_fold, out_fold, fps, thresh: process_local_videos_with_progress(in_fold, out_fold, fps, thresh, progress=gr.Progress()),
                             inputs=[local_input_folder_input, local_output_folder_input, local_frames_per_scene_slider, local_scene_threshold_slider],
                             outputs=[local_extraction_status_markdown]
                         )
