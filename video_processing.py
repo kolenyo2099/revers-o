@@ -359,12 +359,9 @@ def extract_uniform_frames(video_path, output_folder, num_frames=20):
         return False, f"Error extracting uniform frames: {str(e)}", []
 
 def extract_frames_with_progress(urls, folder, fps=2, thresh=30, qual="720p", progress=None):
-    """Process videos from URLs with progress updates for Gradio."""
-    if not YT_DLP_AVAILABLE:
-        return "❌ yt-dlp not available. Install with: pip install yt-dlp"
-
-    if not urls or not folder:
-        return "❌ Please provide URLs and output folder"
+    """Extract frames from videos with progress updates for Gradio."""
+    if not urls:
+        return "❌ No URLs provided"
 
     os.makedirs(folder, exist_ok=True)
     urls = [url.strip() for url in urls.replace(',', '\n').split('\n') if url.strip()]
@@ -372,30 +369,35 @@ def extract_frames_with_progress(urls, folder, fps=2, thresh=30, qual="720p", pr
         return "❌ No valid URLs provided"
 
     status_messages = []
-    def log_status(message):
+    def log_status(message, progress_value=None):
         status_messages.append(message)
-        if progress: progress(desc=message)
+        if progress:
+            if progress_value is not None:
+                progress(progress_value, desc=message)
+            else:
+                progress(0.0, desc=message)
         return "\n".join(status_messages)
 
-    log_status("🔍 Checking video availability...")
+    log_status("🔍 Checking video availability...", 0.0)
     valid_urls = []
-    for url in urls:
+    for i, url in enumerate(urls):
         try:
             with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
                 ydl.extract_info(url, download=False)
             valid_urls.append(url)
+            log_status(f"✅ Valid URL: {url}", 0.1 * (i + 1) / len(urls))
         except Exception as e:
-            log_status(f"⚠️ Skipping invalid URL {url}: {str(e)}")
+            log_status(f"⚠️ Skipping invalid URL {url}: {str(e)}", 0.1 * (i + 1) / len(urls))
 
     if not valid_urls:
         return "❌ No valid video URLs found"
 
-    log_status(f"✅ Found {len(valid_urls)} valid URLs")
+    log_status(f"✅ Found {len(valid_urls)} valid URLs", 0.1)
     total_frames = 0
 
     for i, url in enumerate(valid_urls):
         try:
-            log_status(f"📥 Downloading video {i+1}/{len(valid_urls)}...")
+            log_status(f"📥 Downloading video {i+1}/{len(valid_urls)}...", 0.1 + (0.4 * i / len(valid_urls)))
             with tempfile.TemporaryDirectory() as temp_dir:
                 ydl_opts = {
                     'format': f'bestvideo[height<={qual[:-1]}][ext=mp4]+bestaudio[ext=m4a]/best[height<={qual[:-1]}]',
@@ -405,11 +407,12 @@ def extract_frames_with_progress(urls, folder, fps=2, thresh=30, qual="720p", pr
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
                     video_path = os.path.join(temp_dir, f"{info['id']}.{info['ext']}")
+                log_status(f"✅ Downloaded video {i+1}/{len(valid_urls)}", 0.1 + (0.4 * (i + 1) / len(valid_urls)))
 
-                log_status(f"🎬 Processing video {i+1}/{len(valid_urls)}...")
+                log_status(f"🎬 Processing video {i+1}/{len(valid_urls)}...", 0.5 + (0.4 * i / len(valid_urls)))
                 cap = cv2.VideoCapture(video_path)
                 if not cap.isOpened():
-                    log_status(f"❌ Could not open video: {url}")
+                    log_status(f"❌ Could not open video: {url}", 0.5 + (0.4 * (i + 1) / len(valid_urls)))
                     continue
 
                 # Get video info
@@ -418,9 +421,10 @@ def extract_frames_with_progress(urls, folder, fps=2, thresh=30, qual="720p", pr
                 duration = total_frames_video / fps_video
 
                 # Scene detection
-                scene_manager = detect.SceneManager()
-                scene_manager.add_detector(detect.ContentDetector(threshold=thresh))
-                scene_manager.detect_scenes_file(video_path)
+                scene_manager = SceneManager()
+                scene_manager.add_detector(ContentDetector(threshold=thresh))
+                video = open_video(video_path)
+                scene_manager.detect_scenes(video)
                 scenes = scene_manager.get_scene_list()
 
                 if not scenes:
@@ -457,10 +461,10 @@ def extract_frames_with_progress(urls, folder, fps=2, thresh=30, qual="720p", pr
                                 total_frames += 1
 
                 cap.release()
-                log_status(f"✅ Extracted {total_frames} frames from {url}")
+                log_status(f"✅ Extracted {total_frames} frames from {url}", 0.5 + (0.4 * (i + 1) / len(valid_urls)))
 
         except Exception as e:
-            log_status(f"❌ Error processing {url}: {str(e)}")
+            log_status(f"❌ Error processing {url}: {str(e)}", 0.5 + (0.4 * (i + 1) / len(valid_urls)))
             import traceback; traceback.print_exc()
 
     return f"✅ Completed! Extracted {total_frames} frames from {len(valid_urls)} videos to {folder}"
@@ -502,9 +506,10 @@ def process_local_videos_with_progress(input_folder, output_folder, fps=2, thres
             duration = total_frames_video / fps_video
 
             # Scene detection
-            scene_manager = detect.SceneManager()
-            scene_manager.add_detector(detect.ContentDetector(threshold=thresh))
-            scene_manager.detect_scenes_file(video_path)
+            scene_manager = SceneManager()
+            scene_manager.add_detector(ContentDetector(threshold=thresh))
+            video = open_video(video_path)
+            scene_manager.detect_scenes(video)
             scenes = scene_manager.get_scene_list()
 
             if not scenes:
