@@ -62,7 +62,12 @@ class SimpleReverso:
 
         # State
         self.detected_regions = []
-        self.region_embeddings = []
+        self.region_embeddings = None
+        self.query_embedding_for_search = None
+        self._stop_requested = False
+        self._last_processed_file = None
+        self._partial_embeddings = []
+        self._partial_metadata = []
 
         print("✅ Simple Revers-o ready!")
 
@@ -199,43 +204,51 @@ class SimpleReverso:
 
     def init_grounded_sam(self, text_prompt):
         """Initialize GroundedSAM with text prompt"""
-        if self.grounded_sam is None:
-            # Parse prompts
+        # Always reinitialize GroundedSAM with new prompts
+        # Parse prompts more strictly
+        prompts = []
+        if text_prompt:
             prompts = [p.strip() for p in text_prompt.split('.') if p.strip()]
-            if not prompts:
-                prompts = ["object"]
+        if not prompts:
+            prompts = ["object"]  # Only use this as a last resort
 
-            # Create ontology
-            ontology_dict = {prompt: prompt for prompt in prompts}
-            ontology = CaptionOntology(ontology_dict)
+        # Create ontology with more specific mapping
+        ontology_dict = {prompt: prompt for prompt in prompts}
+        ontology = CaptionOntology(ontology_dict)
 
-            # Initialize GroundedSAM with correct parameters
-            self.grounded_sam = GroundedSAM(
-                ontology=ontology,
-                box_threshold=0.35,
-                text_threshold=0.25
-            )
-            print(f"🎯 GroundedSAM ready with prompts: {prompts}")
-            print(f"[DEBUG] GroundedSAM version: {self.grounded_sam.__version__ if hasattr(self.grounded_sam, '__version__') else 'unknown'}")
-            # print(f"[DEBUG] GroundedSAM config: {self.grounded_sam.__dict__}") # Can be very verbose
+        # Initialize GroundedSAM with correct parameters
+        self.grounded_sam = GroundedSAM(
+            ontology=ontology,
+            box_threshold=0.35,
+            text_threshold=0.25
+        )
+        print(f"🎯 GroundedSAM ready with prompts: {prompts}")
+        print(f"[DEBUG] GroundedSAM version: {self.grounded_sam.__version__ if hasattr(self.grounded_sam, '__version__') else 'unknown'}")
+        # print(f"[DEBUG] GroundedSAM config: {self.grounded_sam.__dict__}") # Can be very verbose
 
-            # Print available methods and attributes
-            # print(f"[DEBUG] Available methods: {[m for m in dir(self.grounded_sam) if not m.startswith('_')]}")
+        # Print available methods and attributes
+        # print(f"[DEBUG] Available methods: {[m for m in dir(self.grounded_sam) if not m.startswith('_')]}")
 
-            # Print predict method signature
-            if hasattr(self.grounded_sam, 'predict'):
-                import inspect
-                # print(f"[DEBUG] Predict method signature: {inspect.signature(self.grounded_sam.predict)}")
+        # Print predict method signature
+        if hasattr(self.grounded_sam, 'predict'):
+            import inspect
+            # print(f"[DEBUG] Predict method signature: {inspect.signature(self.grounded_sam.predict)}")
 
-    def detect_regions(self, image, text_prompt="person . car . building"):
+    def detect_regions(self, image, text_prompt=None):
         """Detect regions using GroundedSAM"""
+        if text_prompt is None:
+            text_prompt = "object"  # Use a generic prompt if none provided
         print(f"🔍 Detecting regions with prompt: '{text_prompt}'")
 
-        # Initialize GroundedSAM if needed
+        # Clear previous detections and embeddings
+        self.detected_regions = []
+        self.region_embeddings = None
+        self.query_embedding_for_search = None
+
+        # Initialize GroundedSAM with new prompts
         self.init_grounded_sam(text_prompt)
 
         # Save image temporarily for GroundedSAM
-        # Ensure temp_path is unique enough if multiple instances run
         temp_dir = tempfile.gettempdir()
         temp_path = os.path.join(temp_dir, f"temp_image_{uuid.uuid4().hex[:8]}.jpg")
 
@@ -277,6 +290,15 @@ class SimpleReverso:
             if isinstance(masks, torch.Tensor):
                 masks = masks.detach().cpu().numpy()
                 # print(f"[DEBUG] Converted masks to numpy array")
+
+            if len(boxes) == 0:
+                # If no detections, create empty mask with correct shape
+                if isinstance(image, np.ndarray):
+                    height, width = image.shape[:2]
+                else:
+                    # Handle PIL Image
+                    width, height = image.size
+                masks = np.zeros((0, height, width), dtype=np.uint8)
 
             self.detected_regions = Detections(
                 xyxy=boxes,
@@ -432,98 +454,198 @@ class SimpleReverso:
             print("✅ Extracted global image embedding")
             return [embedding.cpu()], [meta]
 
-    def create_database(self, folder_path, database_name, text_prompt="person . car . building", use_direct_pe=False, progress_callback=None):
-        """Create searchable database from image folder"""
+    def request_stop(self):
+        """Request to stop the current database creation process."""
+        self._stop_requested = True
+
+    def create_database(self, folder_path, database_name, text_prompt="person . car . building", use_direct_pe=False, progress_callback=None, resume_from_checkpoint=False, include_subfolders=False):
+        """Create searchable database from image folder with checkpoint support"""
         status_messages = []
-        def log_status(message):
+        def log_status(message, progress_value=None):
             status_messages.append(message)
-            if progress_callback: progress_callback(message) # Call external progress update
-            # print(message) # Optional: also print to console
-            return "\n".join(status_messages) # This return is for Gradio Textbox usually
+            if progress_callback: 
+                progress_callback(message, progress_value)
+            return "\n".join(status_messages)
 
-        log_status(f"📁 Creating database '{database_name}' from {folder_path}")
-        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']
-        image_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if any(f.lower().endswith(ext) for ext in image_extensions)]
-
-        if not image_files: return log_status(f"❌ No images found in {folder_path}")
-
-        log_status(f"📊 Found {len(image_files)} images to process")
-        log_status(f"🔧 Processing mode: {'Direct PE' if use_direct_pe else 'GroundedSAM + PE'}")
-
+        # Setup checkpoint directory and file
         db_base_path = "./simple_reverso_db"
         os.makedirs(db_base_path, exist_ok=True)
         db_path = os.path.join(db_base_path, database_name)
-        # os.makedirs(db_path, exist_ok=True) # QdrantClient creates if not exists for path
+        checkpoint_dir = os.path.join(db_base_path, "checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint_file = os.path.join(checkpoint_dir, f"{database_name}_checkpoint.json")
+
+        # Load checkpoint if resuming
+        processed_files = set()
+        if resume_from_checkpoint and os.path.exists(checkpoint_file):
+            try:
+                with open(checkpoint_file, 'r') as f:
+                    checkpoint_data = json.load(f)
+                    processed_files = set(checkpoint_data.get('processed_files', []))
+                    self._partial_embeddings = checkpoint_data.get('partial_embeddings', [])
+                    self._partial_metadata = checkpoint_data.get('partial_metadata', [])
+                    log_status(f"📋 Resuming from checkpoint: {len(processed_files)} files already processed")
+            except Exception as e:
+                log_status(f"⚠️ Error loading checkpoint: {str(e)}. Starting fresh.")
+
+        log_status(f"📁 Creating database '{database_name}' from {folder_path}")
+        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']
+        
+        # Collect image files from folder and subfolders if requested
+        image_files = []
+        if include_subfolders:
+            for root, _, files in os.walk(folder_path):
+                for file in files:
+                    if any(file.lower().endswith(ext) for ext in image_extensions):
+                        image_files.append(os.path.join(root, file))
+        else:
+            image_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) 
+                          if any(f.lower().endswith(ext) for ext in image_extensions)]
+
+        if not image_files: 
+            return log_status(f"❌ No images found in {folder_path}")
+
+        # Filter out already processed files if resuming
+        if resume_from_checkpoint:
+            image_files = [f for f in image_files if f not in processed_files]
+            if not image_files:
+                return log_status("✅ All files already processed. Database is complete.")
+
+        log_status(f"📊 Found {len(image_files)} images to process", 0.1)
+        if include_subfolders:
+            log_status(f"📂 Including images from subfolders")
+        log_status(f"🔧 Processing mode: {'Direct PE' if use_direct_pe else 'GroundedSAM + PE'}")
+
         log_status(f"📂 Database will be stored at: {db_path}")
 
         client = QdrantClient(path=db_path)
-        all_embeddings, all_metadata = [], []
         processed, failed = 0, 0
 
-        for i, image_path in enumerate(image_files):
-            filename = os.path.basename(image_path)
-            log_status(f"🔄 Processing {i+1}/{len(image_files)}: {filename}")
+        def save_checkpoint():
+            """Save current progress to checkpoint file"""
             try:
-                image = Image.open(image_path).convert("RGB")
-                if use_direct_pe:
-                    embeddings, metadata_list = self.process_image_direct_pe(image)
-                    log_status(f"✅ Extracted global embedding for {filename}")
-                else:
-                    num_regions = self.detect_regions(image, text_prompt)
-                    if num_regions > 0:
-                        embeddings, metadata_list = self.extract_embeddings(image)
-                        log_status(f"✅ Found {num_regions} regions, extracted {len(embeddings)} embeddings in {filename}")
-                    else:
-                        log_status(f"⚠️ No regions found in {filename}, skipping")
-                        failed += 1; continue
-
-                for k, meta_item in enumerate(metadata_list):
-                    meta_item["image_source"] = image_path # Store full path
-                    meta_item["filename"] = filename       # Store filename
-                    # Ensure region_id is unique if multiple embeddings per image
-                    if len(metadata_list) > 1:
-                         meta_item["region_id"] = f"{meta_item.get('region_id', uuid.uuid4())}_{k}"
-
-                all_embeddings.extend(embeddings)
-                all_metadata.extend(metadata_list)
-                processed += 1
+                checkpoint_data = {
+                    'processed_files': list(processed_files),
+                    'timestamp': datetime.now().isoformat(),
+                    'database_name': database_name,
+                    'folder_path': folder_path,
+                    'partial_embeddings': self._partial_embeddings,
+                    'partial_metadata': self._partial_metadata
+                }
+                with open(checkpoint_file, 'w') as f:
+                    json.dump(checkpoint_data, f, indent=2)
             except Exception as e:
-                log_status(f"❌ Error processing {filename}: {str(e)}")
-                import traceback; traceback.print_exc()
-                failed += 1; continue
-
-        if not all_embeddings: return log_status(f"❌ No embeddings extracted from any images")
-
-        vector_dim = all_embeddings[0].shape[0]
-        collection_name = f"simple_reverso_{database_name}"
+                log_status(f"⚠️ Error saving checkpoint: {str(e)}")
 
         try:
-            client.recreate_collection( # Use recreate_collection to start fresh
-                collection_name=collection_name,
-                vectors_config=models.VectorParams(size=vector_dim, distance=models.Distance.COSINE)
-            )
-            log_status(f"📦 Recreated collection: {collection_name}")
-        except Exception as e:
-             log_status(f"ℹ️ Note: Collection {collection_name} might already exist or error: {e}")
+            for i, image_path in enumerate(image_files):
+                if self._stop_requested:
+                    log_status("🛑 Stop requested. Saving progress...")
+                    save_checkpoint()
+                    return "\n".join(status_messages) + "\n\n⏸️ Processing stopped. You can resume later."
 
-        points = [models.PointStruct(id=meta["region_id"], vector=emb.cpu().numpy().tolist(), payload=meta) for emb, meta in zip(all_embeddings, all_metadata)]
+                progress_value = 0.1 + (0.7 * (i / len(image_files)))  # Progress from 10% to 80%
+                filename = os.path.basename(image_path)
+                log_status(f"🔄 Processing {i+1}/{len(image_files)}: {filename}", progress_value)
+                
+                try:
+                    image = Image.open(image_path).convert("RGB")
+                    if use_direct_pe:
+                        embeddings, metadata_list = self.process_image_direct_pe(image)
+                        log_status(f"✅ Extracted global embedding for {filename}")
+                    else:
+                        num_regions = self.detect_regions(image, text_prompt)
+                        if num_regions > 0:
+                            embeddings, metadata_list = self.extract_embeddings(image)
+                            log_status(f"✅ Found {num_regions} regions, extracted {len(embeddings)} embeddings in {filename}")
+                        else:
+                            log_status(f"⚠️ No regions found in {filename}, skipping")
+                            failed += 1
+                            processed_files.add(image_path)
+                            save_checkpoint()
+                            continue
 
-        # Batch upsert for efficiency
-        batch_size = 100
-        for j in range(0, len(points), batch_size):
-            batch_points = points[j:j+batch_size]
-            client.upsert(collection_name=collection_name, points=batch_points)
-            log_status(f"💾 Stored batch {j//batch_size + 1}/{(len(points) + batch_size -1)//batch_size} ({len(batch_points)} points)")
+                    for k, meta_item in enumerate(metadata_list):
+                        meta_item["image_source"] = image_path # Store full path
+                        meta_item["filename"] = filename       # Store filename
+                        # Generate a new UUID for each point and store the original region_id in metadata
+                        original_region_id = meta_item.get("region_id", str(uuid.uuid4()))
+                        meta_item["original_region_id"] = original_region_id
+                        meta_item["region_id"] = str(uuid.uuid4())  # New UUID for Qdrant point ID
 
-        self.vector_db = client
-        self.current_database = collection_name
+                    self._partial_embeddings.extend(embeddings)
+                    self._partial_metadata.extend(metadata_list)
+                    processed += 1
+                    processed_files.add(image_path)
+                    
+                    # Save checkpoint every 10 images or if it's the last image
+                    if processed % 10 == 0 or i == len(image_files) - 1:
+                        save_checkpoint()
+                        
+                except Exception as e:
+                    log_status(f"❌ Error processing {filename}: {str(e)}")
+                    import traceback; traceback.print_exc()
+                    failed += 1
+                    processed_files.add(image_path)
+                    save_checkpoint()
+                    continue
 
-        log_status("\n📊 Final Summary:")
-        log_status(f"✅ Successfully processed: {processed} images")
-        if failed > 0: log_status(f"⚠️ Failed to process: {failed} images")
-        log_status(f"🔍 Total embeddings stored: {len(all_embeddings)}")
-        log_status(f"🎯 Database '{database_name}' ready for searching!")
-        return "\n".join(status_messages) # Return final combined status
+            if not self._partial_embeddings: 
+                return log_status(f"❌ No embeddings extracted from any images")
+
+            vector_dim = self._partial_embeddings[0].shape[0]
+            collection_name = f"simple_reverso_{database_name}"
+
+            try:
+                client.recreate_collection( # Use recreate_collection to start fresh
+                    collection_name=collection_name,
+                    vectors_config=models.VectorParams(size=vector_dim, distance=models.Distance.COSINE)
+                )
+                log_status(f"📦 Recreated collection: {collection_name}", 0.8)
+            except Exception as e:
+                 log_status(f"ℹ️ Note: Collection {collection_name} might already exist or error: {e}")
+
+            points = [models.PointStruct(id=meta["region_id"], vector=emb.cpu().numpy().tolist(), payload=meta) 
+                     for emb, meta in zip(self._partial_embeddings, self._partial_metadata)]
+
+            # Batch upsert for efficiency
+            batch_size = 100
+            for j in range(0, len(points), batch_size):
+                if self._stop_requested:
+                    log_status("🛑 Stop requested during database storage. Progress saved.")
+                    save_checkpoint()
+                    return "\n".join(status_messages) + "\n\n⏸️ Processing stopped. You can resume later."
+
+                progress_value = 0.8 + (0.1 * (j / len(points)))  # Progress from 80% to 90%
+                batch_points = points[j:j+batch_size]
+                client.upsert(collection_name=collection_name, points=batch_points)
+                log_status(f"💾 Stored batch {j//batch_size + 1}/{(len(points) + batch_size -1)//batch_size} ({len(batch_points)} points)", progress_value)
+
+            self.vector_db = client
+            self.current_database = collection_name
+
+            # Clean up checkpoint file if everything completed successfully
+            if os.path.exists(checkpoint_file):
+                try:
+                    os.remove(checkpoint_file)
+                    log_status("🧹 Cleaned up checkpoint file")
+                except Exception as e:
+                    log_status(f"⚠️ Could not clean up checkpoint file: {str(e)}")
+
+            log_status("\n📊 Final Summary:", 0.9)
+            log_status(f"✅ Successfully processed: {processed} images")
+            if failed > 0: 
+                log_status(f"⚠️ Failed to process: {failed} images")
+            log_status(f"🔍 Total embeddings stored: {len(self._partial_embeddings)}")
+            log_status(f"🎯 Database '{database_name}' ready for searching!", 1.0)
+
+        finally:
+            # Reset stop flag and partial data
+            self._stop_requested = False
+            self._partial_embeddings = []
+            self._partial_metadata = []
+            
+        return "\n".join(status_messages)
 
     def search_similar(self, similarity_threshold=0.7, max_results=5):
         """Search for similar regions in database"""

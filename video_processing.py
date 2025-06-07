@@ -13,6 +13,7 @@ import shutil
 import hashlib # Used for md5 in download_video_from_url
 import urllib.parse # Used for urlparse in is_supported_video_url
 import yt_dlp # Used for video downloads
+import gradio as gr # Used for progress tracking in UI
 from scenedetect import open_video, SceneManager, ContentDetector # Core scenedetect components used
 # from scenedetect.video_splitter import split_video_ffmpeg # Appears unused
 # from scenedetect.scene_detector import AdaptiveDetector # Appears unused
@@ -357,182 +358,196 @@ def extract_uniform_frames(video_path, output_folder, num_frames=20):
         traceback.print_exc()
         return False, f"Error extracting uniform frames: {str(e)}", []
 
-def extract_frames_with_progress(urls_text, output_folder, frames_per_scene, scene_threshold, max_quality, progress=gr.Progress()):
-    """Process videos from URLs with progress updates for Gradio"""
-    # This function is intended for use with Gradio, so gr.Progress() might be specific.
-    # If not using Gradio, a simpler progress tracking might be needed.
+def extract_frames_with_progress(urls, folder, fps=2, thresh=30, qual="720p", progress=None):
+    """Process videos from URLs with progress updates for Gradio."""
     if not YT_DLP_AVAILABLE:
-        return "❌ yt-dlp not available. Please install it: pip install yt-dlp"
+        return "❌ yt-dlp not available. Install with: pip install yt-dlp"
 
-    # VIDEO_PROCESSING_AVAILABLE is defined at the top of this file
-    if not VIDEO_PROCESSING_AVAILABLE:
-        # This message might be displayed in a Gradio UI, adapt if not.
-        return "⚠️ Scene detection not available, will fall back to uniform extraction"
+    if not urls or not folder:
+        return "❌ Please provide URLs and output folder"
 
-    # Parse URLs from input text (either comma-separated or one per line)
-    if ',' in urls_text:
-        urls = [url.strip() for url in urls_text.split(',') if url.strip()]
-    else:
-        urls = [url.strip() for url in urls_text.split('\n') if url.strip()]
-
+    os.makedirs(folder, exist_ok=True)
+    urls = [url.strip() for url in urls.replace(',', '\n').split('\n') if url.strip()]
     if not urls:
-        return "❌ No URLs provided" # Adapt for non-Gradio use
-
-    # Filter out invalid URLs (is_supported_video_url is in this file)
-    valid_urls = [url for url in urls if is_supported_video_url(url)]
-    invalid_urls = [url for url in urls if not is_supported_video_url(url)]
+        return "❌ No valid URLs provided"
 
     status_messages = []
+    def log_status(message):
+        status_messages.append(message)
+        if progress: progress(desc=message)
+        return "\n".join(status_messages)
 
-    if invalid_urls:
-        status_messages.append(f"⚠️ Skipping {len(invalid_urls)} invalid/unsupported URLs: {', '.join(invalid_urls)}")
+    log_status("🔍 Checking video availability...")
+    valid_urls = []
+    for url in urls:
+        try:
+            with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+                ydl.extract_info(url, download=False)
+            valid_urls.append(url)
+        except Exception as e:
+            log_status(f"⚠️ Skipping invalid URL {url}: {str(e)}")
 
     if not valid_urls:
-        status_messages.append("❌ No valid video URLs found")
-        return "\n".join(status_messages) # Adapt for non-Gradio use
+        return "❌ No valid video URLs found"
 
-    status_messages.append(f"🔗 Found {len(valid_urls)} valid video URLs to process")
+    log_status(f"✅ Found {len(valid_urls)} valid URLs")
+    total_frames = 0
 
-    # Create temporary directory for downloads
-    temp_download_dir = tempfile.mkdtemp(prefix="reverso_downloads_")
-
-    try:
-        total_extracted = 0
-        successful_videos = 0
-        downloaded_files = []
-
-        # Download all videos first
-        status_messages.append(f"📥 Starting downloads to temporary directory...")
-        if progress: progress(0, desc="Starting downloads...") # Gradio progress
-
-        for i, url in enumerate(valid_urls):
-            current_progress = (i + 1) / len(valid_urls)
-            if progress: progress(current_progress, desc=f"Downloading {i+1}/{len(valid_urls)}: {url[:50]}...") # Gradio progress
-
-            status_messages.append(f"📥 Downloading video {i+1}/{len(valid_urls)}: {url}")
-
-            try:
-                # download_video_from_url is in this file
-                success, message, downloaded_file = download_video_from_url(url, temp_download_dir, max_quality)
-
-                if success and downloaded_file:
-                    downloaded_files.append(downloaded_file)
-                    status_messages.append(f"✅ Downloaded: {os.path.basename(downloaded_file)}")
-                else:
-                    status_messages.append(f"❌ Failed to download {url}: {message}")
-
-            except Exception as e:
-                status_messages.append(f"❌ Error downloading {url}: {str(e)}")
-
-        if not downloaded_files:
-            status_messages.append("❌ No videos were successfully downloaded")
-            return "\n".join(status_messages) # Adapt for non-Gradio use
-
-        status_messages.append(f"🎬 Successfully downloaded {len(downloaded_files)} videos. Starting frame extraction...")
-        if progress: progress(0, desc="Starting frame extraction...") # Gradio progress
-
-        # Now process the downloaded videos
-        for i, video_path in enumerate(downloaded_files):
-            video_name = os.path.basename(video_path)
-            current_progress = (i + 1) / len(downloaded_files)
-            if progress: progress(current_progress, desc=f"Processing {video_name} ({i+1}/{len(downloaded_files)})") # Gradio progress
-
-            status_messages.append(f"🎬 Processing video {i+1}/{len(downloaded_files)}: {video_name}")
-
-            # Create subfolder for this video's frames
-            video_output_folder = os.path.join(output_folder, os.path.splitext(video_name)[0])
-
-            try:
-                # extract_frames_from_video is in this file
-                success, message, extracted_frames = extract_frames_from_video(
-                    video_path, video_output_folder, frames_per_scene, scene_threshold
-                )
-
-                if success:
-                    total_extracted += len(extracted_frames)
-                    successful_videos += 1
-                    status_messages.append(f"✅ {video_name}: {message}")
-                else:
-                    status_messages.append(f"❌ {video_name}: {message}")
-
-            except Exception as e:
-                status_messages.append(f"❌ {video_name}: Error - {str(e)}")
-
-        status_messages.append(f"🎉 Processing complete! Successfully processed {successful_videos}/{len(downloaded_files)} videos")
-        status_messages.append(f"📊 Total frames extracted: {total_extracted}")
-        status_messages.append(f"💾 Frames saved to: {output_folder}")
-        if progress: progress(1, desc="Processing Complete!") # Gradio progress
-
-    finally:
-        # Cleanup temporary directory
+    for i, url in enumerate(valid_urls):
         try:
-            shutil.rmtree(temp_download_dir)
-            status_messages.append(f"🧹 Cleaned up temporary downloads")
+            log_status(f"📥 Downloading video {i+1}/{len(valid_urls)}...")
+            with tempfile.TemporaryDirectory() as temp_dir:
+                ydl_opts = {
+                    'format': f'bestvideo[height<={qual[:-1]}][ext=mp4]+bestaudio[ext=m4a]/best[height<={qual[:-1]}]',
+                    'outtmpl': os.path.join(temp_dir, '%(id)s.%(ext)s'),
+                    'quiet': True
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    video_path = os.path.join(temp_dir, f"{info['id']}.{info['ext']}")
+
+                log_status(f"🎬 Processing video {i+1}/{len(valid_urls)}...")
+                cap = cv2.VideoCapture(video_path)
+                if not cap.isOpened():
+                    log_status(f"❌ Could not open video: {url}")
+                    continue
+
+                # Get video info
+                fps_video = cap.get(cv2.CAP_PROP_FPS)
+                total_frames_video = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                duration = total_frames_video / fps_video
+
+                # Scene detection
+                scene_manager = detect.SceneManager()
+                scene_manager.add_detector(detect.ContentDetector(threshold=thresh))
+                scene_manager.detect_scenes_file(video_path)
+                scenes = scene_manager.get_scene_list()
+
+                if not scenes:
+                    log_status(f"⚠️ No scenes detected in {url}, using uniform sampling")
+                    frame_interval = int(fps_video / fps)
+                    for frame_idx in range(0, total_frames_video, frame_interval):
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                        ret, frame = cap.read()
+                        if ret:
+                            timestamp = frame_idx / fps_video
+                            minutes = int(timestamp // 60)
+                            seconds = int(timestamp % 60)
+                            frame_name = f"{info['id']}_{minutes:02d}m{seconds:02d}s.jpg"
+                            frame_path = os.path.join(folder, frame_name)
+                            cv2.imwrite(frame_path, frame)
+                            total_frames += 1
+                else:
+                    log_status(f"✅ Detected {len(scenes)} scenes")
+                    for scene in scenes:
+                        start_frame = scene[0].frame_num
+                        end_frame = scene[1].frame_num
+                        frame_interval = max(1, (end_frame - start_frame) // fps)
+                        
+                        for frame_idx in range(start_frame, end_frame, frame_interval):
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                            ret, frame = cap.read()
+                            if ret:
+                                timestamp = frame_idx / fps_video
+                                minutes = int(timestamp // 60)
+                                seconds = int(timestamp % 60)
+                                frame_name = f"{info['id']}_{minutes:02d}m{seconds:02d}s.jpg"
+                                frame_path = os.path.join(folder, frame_name)
+                                cv2.imwrite(frame_path, frame)
+                                total_frames += 1
+
+                cap.release()
+                log_status(f"✅ Extracted {total_frames} frames from {url}")
+
         except Exception as e:
-            status_messages.append(f"⚠️ Warning: Could not clean up temporary directory: {str(e)}")
+            log_status(f"❌ Error processing {url}: {str(e)}")
+            import traceback; traceback.print_exc()
 
-    return "\n".join(status_messages) # Adapt for non-Gradio use
+    return f"✅ Completed! Extracted {total_frames} frames from {len(valid_urls)} videos to {folder}"
 
-def process_local_videos_with_progress(input_folder, output_folder, frames_per_scene, scene_threshold, progress=gr.Progress()):
-    """Process local video files with progress updates for Gradio"""
-    # VIDEO_PROCESSING_AVAILABLE is defined at the top of this file
-    if not VIDEO_PROCESSING_AVAILABLE:
-        return "⚠️ Scene detection not available, will fall back to uniform extraction" # Adapt for non-Gradio use
+def process_local_videos_with_progress(input_folder, output_folder, fps=2, thresh=30, progress=None):
+    """Process local videos with progress updates for Gradio."""
+    if not input_folder or not output_folder:
+        return "❌ Please provide input and output folders"
 
-    # Supported video extensions (already defined as SUPPORTED_VIDEO_EXTENSIONS)
-    # video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v'}
-
-    # Find all video files
-    video_files = []
-    if not os.path.isdir(input_folder):
-        return f"❌ Input folder not found: {input_folder}"
-
-    for file in os.listdir(input_folder):
-        if os.path.splitext(file.lower())[1] in SUPPORTED_VIDEO_EXTENSIONS:
-            video_files.append(os.path.join(input_folder, file))
+    os.makedirs(output_folder, exist_ok=True)
+    video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.webm']
+    video_files = [f for f in os.listdir(input_folder) if any(f.lower().endswith(ext) for ext in video_extensions)]
 
     if not video_files:
-        return "❌ No video files found in the specified folder" # Adapt for non-Gradio use
+        return f"❌ No video files found in {input_folder}"
 
     status_messages = []
-    status_messages.append(f"📹 Found {len(video_files)} video files to process")
-    if progress: progress(0, desc=f"Found {len(video_files)} videos...") # Gradio progress
+    def log_status(message):
+        status_messages.append(message)
+        if progress: progress(desc=message)
+        return "\n".join(status_messages)
 
-    total_extracted = 0
-    successful_videos = 0
+    log_status(f"📁 Found {len(video_files)} videos to process")
+    total_frames = 0
 
-    for i, video_path in enumerate(video_files):
-        video_name = os.path.basename(video_path)
-        current_progress = (i + 1) / len(video_files)
-        if progress: progress(current_progress, desc=f"Processing {video_name} ({i+1}/{len(video_files)})") # Gradio progress
-
-        status_messages.append(f"🎬 Processing video {i+1}/{len(video_files)}: {video_name}")
-
-        # Create subfolder for this video's frames
-        video_output_folder = os.path.join(output_folder, os.path.splitext(video_name)[0])
-
+    for i, video_file in enumerate(video_files):
         try:
-            # extract_frames_from_video is in this file
-            success, message, extracted_frames = extract_frames_from_video(
-                video_path, video_output_folder, frames_per_scene, scene_threshold
-            )
+            video_path = os.path.join(input_folder, video_file)
+            log_status(f"🎬 Processing video {i+1}/{len(video_files)}: {video_file}")
 
-            if success:
-                total_extracted += len(extracted_frames)
-                successful_videos += 1
-                status_messages.append(f"✅ {video_name}: {message}")
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                log_status(f"❌ Could not open video: {video_file}")
+                continue
+
+            # Get video info
+            fps_video = cap.get(cv2.CAP_PROP_FPS)
+            total_frames_video = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = total_frames_video / fps_video
+
+            # Scene detection
+            scene_manager = detect.SceneManager()
+            scene_manager.add_detector(detect.ContentDetector(threshold=thresh))
+            scene_manager.detect_scenes_file(video_path)
+            scenes = scene_manager.get_scene_list()
+
+            if not scenes:
+                log_status(f"⚠️ No scenes detected in {video_file}, using uniform sampling")
+                frame_interval = int(fps_video / fps)
+                for frame_idx in range(0, total_frames_video, frame_interval):
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                    ret, frame = cap.read()
+                    if ret:
+                        timestamp = frame_idx / fps_video
+                        minutes = int(timestamp // 60)
+                        seconds = int(timestamp % 60)
+                        frame_name = f"{os.path.splitext(video_file)[0]}_{minutes:02d}m{seconds:02d}s.jpg"
+                        frame_path = os.path.join(output_folder, frame_name)
+                        cv2.imwrite(frame_path, frame)
+                        total_frames += 1
             else:
-                status_messages.append(f"❌ {video_name}: {message}")
+                log_status(f"✅ Detected {len(scenes)} scenes")
+                for scene in scenes:
+                    start_frame = scene[0].frame_num
+                    end_frame = scene[1].frame_num
+                    frame_interval = max(1, (end_frame - start_frame) // fps)
+                    
+                    for frame_idx in range(start_frame, end_frame, frame_interval):
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                        ret, frame = cap.read()
+                        if ret:
+                            timestamp = frame_idx / fps_video
+                            minutes = int(timestamp // 60)
+                            seconds = int(timestamp % 60)
+                            frame_name = f"{os.path.splitext(video_file)[0]}_{minutes:02d}m{seconds:02d}s.jpg"
+                            frame_path = os.path.join(output_folder, frame_name)
+                            cv2.imwrite(frame_path, frame)
+                            total_frames += 1
+
+            cap.release()
+            log_status(f"✅ Extracted {total_frames} frames from {video_file}")
 
         except Exception as e:
-            status_messages.append(f"❌ {video_name}: Error - {str(e)}")
+            log_status(f"❌ Error processing {video_file}: {str(e)}")
+            import traceback; traceback.print_exc()
 
-    status_messages.append(f"🎉 Processing complete! Successfully processed {successful_videos}/{len(video_files)} videos")
-    status_messages.append(f"📊 Total frames extracted: {total_extracted}")
-    status_messages.append(f"💾 Frames saved to: {output_folder}")
-    if progress: progress(1, desc="Processing Complete!") # Gradio progress
-
-    return "\n".join(status_messages) # Adapt for non-Gradio use
+    return f"✅ Completed! Extracted {total_frames} frames from {len(video_files)} videos to {output_folder}"
 
 # Gradio import for progress, will only be used if Gradio is installed and these functions are called from Gradio context
 try:

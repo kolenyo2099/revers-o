@@ -2,10 +2,18 @@
 # This file contains the Gradio interface definition and its callback functions.
 
 import gradio as gr
+from gradio import Progress
 import os
 # import sys # Appears unused
 import traceback # For error handling in callbacks
 from pathlib import Path # Used for loading README.md
+from PIL import ImageDraw, ImageFont
+import json
+import numpy as np
+from typing import List, Dict, Any, Optional, Tuple
+import logging
+from datetime import datetime
+import uuid
 
 # Import core system and instantiate it globally for UI functions to use
 from core_system import SimpleReverso
@@ -18,29 +26,18 @@ from video_processing import (
     YT_DLP_AVAILABLE,
     VIDEO_PROCESSING_AVAILABLE
 )
-
-# Placeholder for UI helper functions and create_simple_interface
-# These will be moved from main.py
-# Example:
-# def build_database_ui_callback(folder_path, db_name, db_prompt, use_direct_pe):
-#     # ... uses global reverso instance ...
-#     pass
-
-# def create_simple_interface():
-#     # ... defines the gr.Blocks() interface ...
-#     pass
-
-# Helper functions (callbacks for Gradio interface)
-# These functions will use the global 'reverso' instance.
-
 def detect_and_extract_ui(image, text_prompt, use_direct_pe=False):
     """Detect regions and extract embeddings - UI focused wrapper."""
     if image is None:
         return None, "❌ Please upload an image", gr.update(choices=[], value=None, visible=False), None
 
     try:
+        # Clear previous embeddings before new detection
+        reverso.region_embeddings = []
+        
         if use_direct_pe:
             embeddings, metadata = reverso.process_image_direct_pe(image)
+            reverso.region_embeddings = embeddings  # Store embeddings for search
             result_text = (f"✅ Processed image directly with PE\n"
                            f"🧠 Extracted global image embedding\n"
                            f"🎯 Ready to search!")
@@ -52,6 +49,7 @@ def detect_and_extract_ui(image, text_prompt, use_direct_pe=False):
                 return None, f"❌ No regions found with prompt: '{text_prompt}'", gr.update(choices=[], value=None, visible=False), None
 
             embeddings, metadata = reverso.extract_embeddings(image)
+            reverso.region_embeddings = embeddings  # Store embeddings for search
             viz_image = reverso.visualize_detections(image) # Visualize all detections
 
             region_options = []
@@ -76,74 +74,66 @@ def detect_and_extract_with_state_ui(image, text_prompt, use_direct_pe=False):
     # The 'image' itself is stored in detected_image_state by Gradio, this function just passes through results
     return viz, status, region_options_update, image # Pass image to update detected_image_state
 
-def build_database_ui(folder_path, db_name, db_prompt, use_direct_pe, progress=gr.Progress(track_tqdm=True)):
-    """Build searchable database - UI focused wrapper."""
-    if not folder_path or not db_name:
-        return "❌ Please provide folder path and database name"
-    if not os.path.exists(folder_path):
-        return f"❌ Folder not found: {folder_path}"
-
-    status_updates = []
-    def progress_callback_for_gradio(message):
-        # This function will be called by SimpleReverso.create_database
-        # It needs to update the Gradio progress bar and collect messages.
-        # For now, let's just collect messages. Progress bar update in Gradio is tricky with external callbacks.
-        # A simpler way is to let create_database return messages and update progress based on image count.
-        status_updates.append(message)
-        # We can't directly call progress.update here if it's not the main thread.
-        # Instead, create_database in core_system.py was modified to have its own loop and log_status
-        # and we can use that log_status to update the UI if we pass a Gradio progress object.
-        # For now, the progress_callback in core_system.py is a placeholder.
-        # The main progress will be handled by tqdm within create_database if possible,
-        # or we update progress based on the number of images processed.
-
-    progress(0, desc="Starting database creation...")
+def build_database_ui(folder_path, db_name, db_prompt, use_direct_pe, resume_from_checkpoint, include_subfolders, progress=gr.Progress()):
+    """Create searchable database from images - UI focused wrapper."""
     try:
-        # The progress_callback in SimpleReverso.create_database is basic for now.
-        # We'll rely on the final output string primarily.
-        # A more advanced setup would involve a queue or direct gr.Progress updates from the core.
-        # For simplicity, the core function `create_database` logs to console.
-        # We can simulate progress here or enhance core_system later.
+        def progress_callback(message, progress_value=None):
+            if progress_value is not None:
+                progress(progress_value, desc=message)
+            else:
+                progress(0.0, desc=message)
 
-        # Simulate progress for UI:
-        # This is a placeholder. Actual progress should be driven by create_database.
-        # For now, create_database returns a string of logs.
-        def dummy_progress_for_gradio(status_str):
-            # This is a simple way to update the textbox, not a real progress bar update from core
-            # This will be the Textbox output from the create_database function itself.
-            pass
-
-        result = reverso.create_database(folder_path, db_name, db_prompt, use_direct_pe, progress_callback=dummy_progress_for_gradio)
-        progress(1, desc="Database creation complete.")
-        return result # This will be a string of logs.
+        result = reverso.create_database(
+            folder_path=folder_path,
+            database_name=db_name,
+            text_prompt=db_prompt,
+            use_direct_pe=use_direct_pe,
+            resume_from_checkpoint=resume_from_checkpoint,
+            include_subfolders=include_subfolders,
+            progress_callback=progress_callback
+        )
+        
+        # Add finalization message if not already present
+        if "Database" in result and "ready for searching" in result:
+            if "✨ Finalization complete" not in result:
+                result += "\n\n✨ Finalization complete - Database is ready to use!"
+        
+        return result
     except Exception as e:
         traceback.print_exc()
-        progress(1, desc="Error during database creation.")
-        return f"❌ Error creating database: {str(e)}"
+        return f"❌ Error: {str(e)}"
+
+def stop_database_creation():
+    """Stop the current database creation process."""
+    try:
+        reverso.request_stop()
+        return "⏸️ Stop requested. Progress will be saved."
+    except Exception as e:
+        return f"❌ Error requesting stop: {str(e)}"
 
 def search_database_ui(similarity_threshold, max_results, current_search_results_state, selected_region_info=None):
-    """Search for similar regions - UI focused wrapper."""
+    """Search database for similar images using the current query image."""
     try:
-        if selected_region_info and reverso.region_embeddings:
-            # selected_region_info is like "Region 1: person (Conf: 0.85)"
+        if not reverso.vector_db:
+            return "⚠️ No database loaded. Please create or load a database first.", gr.update(choices=[], value=None), None, []
+
+        if not reverso.region_embeddings:
+            return "⚠️ No embeddings available. Please detect regions first.", gr.update(choices=[], value=None), None, []
+
+        if selected_region_info and selected_region_info != "Region 1:":
             try:
                 region_index = int(selected_region_info.split()[1].rstrip(':')) - 1
                 if 0 <= region_index < len(reverso.region_embeddings):
-                    # Set the query embedding in reverso object to the selected one
-                    reverso.query_embedding_for_search = [reverso.region_embeddings[region_index]]
-                    # Note: SimpleReverso needs a way to set which embedding to use for search,
-                    # or search_similar should take an embedding as input.
-                    # For now, let's assume search_similar uses the first one in region_embeddings,
-                    # so we modify region_embeddings. This is a bit of a hack.
-                    # A cleaner way: reverso.search_similar(embedding_to_search=reverso.region_embeddings[region_index], ...)
-                    # For this refactor, we keep current SimpleReverso logic: it uses self.region_embeddings[0]
-                    # So, we temporarily modify self.region_embeddings to only contain the selected one.
-                    original_embeddings = reverso.region_embeddings # Store original
-                    reverso.region_embeddings = [reverso.region_embeddings[region_index]]
+                    # Create a temporary copy of the embeddings list
+                    temp_embeddings = reverso.region_embeddings.copy()
+                    # Use only the selected region's embedding
+                    reverso.region_embeddings = [temp_embeddings[region_index]]
                     result_text, similar_items_data = reverso.search_similar(similarity_threshold, max_results)
-                    reverso.region_embeddings = original_embeddings # Restore original
+                    # Restore original embeddings
+                    reverso.region_embeddings = temp_embeddings
                 else:
-                    return "⚠️ Invalid region selected. Please re-detect.", gr.update(choices=[], value=None), None, [], []
+                    result_text = "⚠️ Invalid region index. Using first region."
+                    result_text, similar_items_data = reverso.search_similar(similarity_threshold, max_results)
             except (ValueError, IndexError) as e:
                 # Fallback to first region if parsing fails or index is bad
                 result_text, similar_items_data = reverso.search_similar(similarity_threshold, max_results)
@@ -153,25 +143,15 @@ def search_database_ui(similarity_threshold, max_results, current_search_results
 
         image_options = [f"Image {i+1} (Score: {item['score']:.3f})" for i, item in enumerate(similar_items_data) if item["image"] is not None]
 
-        thumbnail_gallery = []
-        for item_data in similar_items_data:
-            if item_data and item_data["image"] is not None:
-                thumbnail = item_data["image"].copy()
-                thumbnail.thumbnail((200, 200))
-                thumbnail_gallery.append(thumbnail)
-
-        main_display_image = similar_items_data[0]["image"] if similar_items_data and similar_items_data[0]["image"] else None
-
         return (
             result_text,
             gr.update(choices=image_options, value=image_options[0] if image_options else None),
-            main_display_image,
-            similar_items_data, # This state will hold the list of dicts
-            thumbnail_gallery
+            similar_items_data[0]["image"] if similar_items_data and similar_items_data[0]["image"] else None,
+            similar_items_data
         )
     except Exception as e:
         traceback.print_exc()
-        return f"❌ Search error: {str(e)}", gr.update(choices=[], value=None), None, [], []
+        return f"❌ Search error: {str(e)}", gr.update(choices=[], value=None), None, []
 
 def update_similar_image_ui(selected_image_option, search_results_data_state):
     """Update the displayed similar image based on dropdown selection."""
@@ -182,11 +162,36 @@ def update_similar_image_ui(selected_image_option, search_results_data_state):
         if 0 <= index < len(search_results_data_state):
             item_data = search_results_data_state[index]
             if item_data and item_data["image"] is not None:
-                return item_data["image"]
+                # Create a copy of the image to add text
+                img = item_data["image"].copy()
+                # Add filename and score as text overlay
+                draw = ImageDraw.Draw(img)
+                try:
+                    font = ImageFont.truetype("Arial", 20)
+                except:
+                    font = ImageFont.load_default()
+                
+                # Get filename and score
+                filename = item_data.get("filename", "Unknown")
+                score = item_data.get("score", 0)
+                text = f"File: {filename}\nScore: {score:.3f}"
+                
+                # Add semi-transparent background for text
+                text_bbox = draw.textbbox((0, 0), text, font=font)
+                text_width = text_bbox[2] - text_bbox[0]
+                text_height = text_bbox[3] - text_bbox[1]
+                draw.rectangle(
+                    [(0, 0), (text_width + 20, text_height + 20)],
+                    fill=(0, 0, 0, 128)
+                )
+                
+                # Add text
+                draw.text((10, 10), text, fill=(255, 255, 255), font=font)
+                return img
         return None
     except Exception as e:
         traceback.print_exc()
-        return f"❌ Error updating similar image display: {str(e)}"
+        return None
 
 def list_available_databases_ui():
     databases = reverso.list_databases()
@@ -225,11 +230,11 @@ def reload_database_list_ui():
 def create_simple_interface():
     """Create simplified Gradio interface using the global 'reverso' instance."""
 
-    with gr.Blocks(title="Simple Revers-o: Visual Investigation Tool") as demo:
+    with gr.Blocks(title="Revers-o: Visual Investigation Tool") as demo:
         similar_items_state = gr.State([]) # Stores list of dicts from search_similar
         detected_image_state = gr.State(None) # Stores the PIL image that has detections
 
-        gr.Markdown("# 🔍 Simple Revers-o: Visual Investigation Tool")
+        gr.Markdown("# 🔍 Revers-o: Visual Investigation Tool")
         gr.Markdown("**GroundedSAM + PE-Core-L14-336 for visual similarity search**")
 
         with gr.Tabs():
@@ -249,7 +254,7 @@ def create_simple_interface():
                             url_extraction_status_markdown = gr.Markdown("URL processing status...")
 
                             url_extract_button.click(
-                                lambda urls, folder, fps, thresh, qual: extract_frames_with_progress(urls, folder, fps, thresh, qual, progress=gr.Progress(track_tqdm=True)),
+                                lambda urls, folder, fps, thresh, qual: extract_frames_with_progress(urls, folder, fps, thresh, qual, progress=gr.Progress()),
                                 inputs=[video_urls_input, url_output_folder_input, url_frames_per_scene_slider, url_scene_threshold_slider, url_max_quality_dropdown],
                                 outputs=[url_extraction_status_markdown]
                             )
@@ -275,21 +280,39 @@ def create_simple_interface():
                 gr.Markdown("## Build a searchable database from your images")
                 db_folder_input = gr.Textbox(label="📁 Image Folder Path", placeholder="/path/to/images")
                 db_name_input = gr.Textbox(label="🏷️ Database Name", placeholder="my_visual_db")
-                db_prompt_input = gr.Textbox(label="🎯 Detection Prompts (optional, period-separated)", value="person . car . building")
-                db_use_direct_pe_checkbox = gr.Checkbox(label="🔍 Use Direct PE (no object detection, faster)", value=False)
-                build_db_button = gr.Button("🚀 Build Database", variant="primary")
-                db_status_output = gr.Textbox(label="📊 Database Creation Status", lines=10, interactive=False)
+                db_prompt_input = gr.Textbox(
+                    label="🎯 Detection Prompts (period-separated, e.g. 'car . building')",
+                    placeholder="Enter prompts separated by periods",
+                    value=""
+                )
+                with gr.Row():
+                    db_use_direct_pe_checkbox = gr.Checkbox(label="🔍 Use Direct PE (no object detection, faster)", value=False)
+                    db_resume_checkpoint_checkbox = gr.Checkbox(label="🔄 Resume from checkpoint", value=False)
+                    db_include_subfolders_checkbox = gr.Checkbox(label="📂 Include subfolders", value=False)
+                with gr.Row():
+                    build_db_button = gr.Button("🚀 Build Database", variant="primary")
+                    stop_db_button = gr.Button("⏸️ Stop Processing", variant="stop")
+                db_status_output = gr.Markdown("Database creation status will appear here...")
 
                 build_db_button.click(
                     build_database_ui, # Uses global reverso
-                    inputs=[db_folder_input, db_name_input, db_prompt_input, db_use_direct_pe_checkbox],
+                    inputs=[db_folder_input, db_name_input, db_prompt_input, db_use_direct_pe_checkbox, db_resume_checkpoint_checkbox, db_include_subfolders_checkbox],
+                    outputs=[db_status_output]
+                )
+
+                stop_db_button.click(
+                    stop_database_creation,
                     outputs=[db_status_output]
                 )
 
             with gr.TabItem("🔎 Search Similar"):
                 gr.Markdown("## Search for similar regions in your database")
                 search_input_image = gr.Image(label="Upload Image for Query", type="pil")
-                search_text_prompt_input = gr.Textbox(label="Detection Prompt for Query Image", value="person . car . building")
+                search_text_prompt_input = gr.Textbox(
+                    label="Detection Prompt for Query Image",
+                    placeholder="Enter prompt for detection (e.g. 'car . building')",
+                    value=""
+                )
                 search_use_direct_pe_checkbox = gr.Checkbox(label="Use Direct PE for Query Image", value=False)
                 detect_query_button = gr.Button("🔎 Detect Regions / Process Query")
 
@@ -317,12 +340,11 @@ def create_simple_interface():
                 search_results_summary_textbox = gr.Textbox(label="🔍 Search Results Summary", lines=10, interactive=False)
                 similar_image_selector_dropdown = gr.Dropdown(label="Select Result to View", choices=[], interactive=True)
                 similar_image_display = gr.Image(label="Selected Similar Image Result", type="pil", interactive=False)
-                results_thumbnail_gallery = gr.Gallery(label="Search Results Thumbnails", columns=5, height=400, interactive=False)
 
                 search_db_button.click(
                     search_database_ui, # uses global reverso
                     inputs=[similarity_threshold_slider, max_results_dropdown, similar_items_state, query_region_selector_dropdown],
-                    outputs=[search_results_summary_textbox, similar_image_selector_dropdown, similar_image_display, similar_items_state, results_thumbnail_gallery]
+                    outputs=[search_results_summary_textbox, similar_image_selector_dropdown, similar_image_display, similar_items_state]
                 )
 
                 similar_image_selector_dropdown.change(
@@ -355,7 +377,23 @@ def create_simple_interface():
                 reload_db_list_button.click(reload_database_list_ui, outputs=[db_selector_dropdown, db_management_status_textbox])
 
             with gr.TabItem("ℹ️ About"):
-                gr.Markdown(Path("README.md").read_text() if os.path.exists("README.md") else "Simple Revers-o: Visual Investigation Tool. See README.md for more details.")
+                gr.Markdown("""
+                # Revers-o: Visual Investigation Tool for Journalists
+
+                ## Key Capabilities:
+                
+                - **Track Objects Across Multiple Videos**: Follow persons, vehicles, or items through different footage sources
+                - **Extract & Analyze Video Frames**: Automatically capture key frames from online or local videos
+                - **Object-Based Search**: Find specific objects by appearance rather than metadata
+                - **Cross-Source Analysis**: Connect visual evidence across multiple sources and timeframes
+                
+                ## Journalistic Applications:
+                
+                - Verify the presence of specific people or objects in multiple videos
+                - Establish visual timelines by tracking objects across footage from different sources
+                - Identify repeated visual patterns across large volumes of video evidence
+                - Support investigative reporting with powerful visual correlation capabilities
+                """)
 
 
     return demo

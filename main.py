@@ -14,6 +14,7 @@ Simplified based on PE research:
 
 # Import the UI creation function
 from ui import create_simple_interface
+import os
 
 # =============================================================================
 # MAIN EXECUTION
@@ -25,16 +26,15 @@ if __name__ == "__main__":
     # The SimpleReverso instance is created within ui.py
     # The create_simple_interface function (from ui.py) builds the Gradio app
     
-    # Create and launch interface
-    # No need to check if create_simple_interface exists if the import succeeded.
-    # If it didn't, an ImportError would have already occurred.
+    # Create the interface
     demo = create_simple_interface()
-    
-    print("🌐 Launching Gradio interface...")
+
+    # Launch the interface
     demo.launch(
-        share=False, # Set to True to share publicly (requires internet access for Gradio)
-        server_name="127.0.0.1", # Listen on localhost
-        server_port=7860,        # Standard Gradio port
-        show_error=True,         # Show errors in the browser console
-        # debug=True             # Uncomment for Gradio's debug mode
+        server_name="127.0.0.1",  # Use localhost
+        server_port=None,         # Let Gradio find an available port
+        share=False,              # Don't create public URL by default
+        show_error=True,          # Show detailed error messages
+        show_api=False,           # Hide API documentation
+        favicon_path="favicon.ico" if os.path.exists("favicon.ico") else None
     )
