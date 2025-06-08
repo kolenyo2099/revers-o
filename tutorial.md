@@ -9,7 +9,7 @@
 6. [Searching for Similar Content](#searching-for-similar-content)
 7. [Parameter Guide](#parameter-guide)
 8. [Tips and Best Practices](#tips-and-best-practices)
-10. [Troubleshooting](#troubleshooting)
+9. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -35,7 +35,7 @@ Revers-o combines two complementary AI systems to provide comprehensive visual a
 - **GroundedSAM** excels at precise object detection and segmentation based on natural language descriptions, but operates primarily on explicit, describable objects
 - **Perception Encoders** capture rich semantic relationships and abstract visual concepts, but lacks the ability to follow complex user prompts.
 
-By combining them, Revers-o allows you to describe what objects you want your database to be made of  AND create high quality embeddings
+By combining them, Revers-o allows you to describe what objects you want your database to be made of AND create high quality embeddings for visual similarity search.
 
 ### GroundedSAM: The Object Detective
 
@@ -59,43 +59,6 @@ Meta's Perception Encoders are AI systems that understand the visual "meaning" o
 
 **Real-world example:**
 If you have footage of a protest and want to find all images showing the same building in the background, Perception Encoders may be able to identify that building across different angles, lighting conditions, and camera positions.
-
-### The Hierarchical Nature of Visual Understanding
-
-Recent research by Meta has revealed a crucial insight: different layers of Perception Encoders capture different aspects of visual understanding:
-
-**Early Layers (Low-level features):**
-- Edges, textures, and basic shapes
-- Color patterns and gradients
-- Simple geometric structures
-
-**Middle Layers (Mid-level features):**
-- Object parts and components
-- Spatial arrangements
-- Local patterns and motifs
-
-**Later Layers (High-level features):**
-- Complete objects and scenes
-- Abstract concepts and relationships
-- Semantic understanding
-
-**How Revers-o Leverages This Hierarchy:**
-
-This multi-layered understanding theoretically enables Revers-o to search for both concrete and abstract visual concepts:
-
-**Concrete Searches:**
-- "Person wearing red jacket" (specific object detection)
-- "Blue car with license plate" (detailed object features)
-- "Building with glass facade" (architectural elements)
-
-**Abstract Concept Searches:**
-- Visual similarity based on "mood" or "atmosphere"
-- Scenes with similar "energy" or "tension"
-- Images that convey similar "emotions" or "contexts"
-- Compositional similarities (similar layouts, even with different objects)
-
-
-This hierarchical approach means Revers-o can help investigators to explore their visual databases in multiple ways by creating and searching embeddings from different layers.
 
 ---
 
@@ -262,7 +225,7 @@ Revers-o offers two methods for processing videos into searchable image database
 
 ### Interpreting Results
 - **Similarity Score**: Higher numbers = more similar (0.0-1.0 scale)
-- **Bounding Boxes**: Show exactly what was matched
+- **Gallery View**: Displays all matching images with their similarity scores
 - **File Paths**: Help locate original images
 
 ---
